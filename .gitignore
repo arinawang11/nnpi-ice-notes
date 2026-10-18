@@ -1,0 +1,46 @@
+# binaries, weights and firmware — never committed
+*.bin
+*.pth
+*.pt
+*.onnx
+*.img
+*.iso
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# local runtime trees
+py/
+site/
+wheels/
+wheels*/
+card-py/
+*.whl
+
+# credentials
+id_*
+*.key
+*.pem
+*.p12
+*.pfx
+known_hosts
+
+# logs and scratch
+*.log
+*.dmp
+dmesg*
+out/
+tmp/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
