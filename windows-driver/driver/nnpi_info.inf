@@ -5,7 +5,7 @@ Signature="$WINDOWS NT$"
 Class=System
 ClassGuid={4D36E97D-E325-11CE-BFC1-08002BE10318}
 Provider=%Provider%
-DriverVer=09/20/2026,15.4.45.211
+DriverVer=09/20/2026,15.4.45.213
 CatalogFile=nnpi_info.cat
 PnpLockdown=1
 

@@ -6,7 +6,7 @@
 /* Only completed parser frames may be routed. Never inspect payload QW low bits.
  * ETH_CONFIG without a current session is evidence, not a boot failure. */
 enum nnpi_runtime_route { NNPI_RUNTIME_ROUTE_VERSION=1, NNPI_RUNTIME_ROUTE_EVENT,
-    NNPI_RUNTIME_ROUTE_SYSINFO, NNPI_RUNTIME_ROUTE_UNEXPECTED_NET, NNPI_RUNTIME_ROUTE_INVALID };
+    NNPI_RUNTIME_ROUTE_SYSINFO, NNPI_RUNTIME_ROUTE_UNEXPECTED_NET, NNPI_RUNTIME_ROUTE_DESCRIPTOR, NNPI_RUNTIME_ROUTE_INVALID };
 static inline uint64_t nnpi_runtime_saturating_increment(uint64_t value)
 { return value==UINT64_MAX ? value : value+1; }
 static inline int nnpi_runtime_route_frame(const struct nnpi_runtime_message *m)
@@ -18,6 +18,7 @@ static inline int nnpi_runtime_route_frame(const struct nnpi_runtime_message *m)
     case 4: return NNPI_RUNTIME_ROUTE_EVENT;
     case 11: return NNPI_RUNTIME_ROUTE_SYSINFO;
     case 39: return NNPI_RUNTIME_ROUTE_UNEXPECTED_NET;
+    case 40: return NNPI_RUNTIME_ROUTE_DESCRIPTOR;
     default: return NNPI_RUNTIME_ROUTE_INVALID;
     }
 }

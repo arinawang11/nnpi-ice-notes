@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals"><ProjectGuid>{439D8C15-2C0B-49F3-BF49-53AC92F47A78}</ProjectGuid><RootNamespace>nnpi_net_bridge</RootNamespace><WindowsTargetPlatformVersion>$(NnpiWdkVersion)</WindowsTargetPlatformVersion></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration"><ConfigurationType>Application</ConfigurationType><PlatformToolset>v143</PlatformToolset><CharacterSet>Unicode</CharacterSet></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(ProjectDir)..\build\$(Platform)\$(Configuration)\tools\</OutDir>
+    <IntDir>$(ProjectDir)..\build\obj\$(Platform)\$(Configuration)\bridge\</IntDir><TargetName>nnpi-net-bridge</TargetName>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(DependencyCheckOnly)'=='true'">
+    <OutDir>$(ProjectDir)..\build\dependency-check\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)..\build\obj\dependency-check\$(Platform)\$(Configuration)\bridge\</IntDir>
+    <TargetName>nnpi-net-bridge-dependency-check</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup><ClCompile>
+    <WarningLevel>Level4</WarningLevel><TreatWarningAsError>true</TreatWarningAsError><LanguageStandard>stdcpp17</LanguageStandard><ExceptionHandling>Sync</ExceptionHandling>
+    <AdditionalIncludeDirectories>$(NnpiTapIncludeDir);$(ProjectDir)..\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    <PreprocessorDefinitions Condition="'$(DependencyCheckOnly)'=='true'">NNPI_BRIDGE_DEPENDENCY_CHECK;UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+  </ClCompile><Link><SubSystem>Console</SubSystem><AdditionalDependencies>setupapi.lib;%(AdditionalDependencies)</AdditionalDependencies></Link></ItemDefinitionGroup>
+  <ItemGroup><ClCompile Include="nnpi-net-bridge.cpp" /></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="ValidateDependencies" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(Platform)'!='x64'" Text="Only x64 is supported." />
+    <Error Condition="'$(NnpiWdkVersion)'==''" Text="Specify NnpiWdkVersion from local SDK inventory." />
+    <Error Condition="'$(DependencyCheckOnly)'!='true' and !Exists('$(NnpiTapIncludeDir)\tap-windows.h')" Text="Official OpenVPN tap-windows6 tap-windows.h is required. Supply NnpiTapIncludeDir after verifying provenance. Do not fabricate IOCTL values. DependencyCheckOnly=true builds a NON-FUNCTIONAL, no-device-access check executable only." />
+  </Target>
+</Project>

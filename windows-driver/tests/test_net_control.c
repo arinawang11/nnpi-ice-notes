@@ -25,6 +25,7 @@ int main(void)
     uint32_t statuses[]={0x103,0x40000000,0xc0000001};
     unsigned i;
     v.channel_version=0x04c0; v.response_sizes[7]=1; v.command_sizes[25]=2;
+    v.response_sizes[8]=1; v.command_sizes[26]=1;
     g.compatible=g.healthy=g.boot_worker=g.driver_ready=g.available=1;
     g.boot_phase=NNPI_BS_DRIVER_READY; g.generation=g.boot_generation=2;
     g.epoch=g.boot_epoch=3; g.version=&v;
@@ -39,6 +40,10 @@ int main(void)
     assert(nnpi_net_control_gate(&g,2,3,256,1,NULL,0)!=0);
     v.command_sizes[25]=1; assert(nnpi_net_control_gate(&g,2,3,256,1,mac,0)==NNPI_NET_GATE_CAP_MISSING);
     v.command_sizes[25]=2;
+    v.response_sizes[8]=0; assert(nnpi_net_control_gate(&g,2,3,256,1,mac,0)==NNPI_NET_GATE_CAP_MISSING);
+    v.response_sizes[8]=1; v.command_sizes[26]=0;
+    assert(nnpi_net_control_gate(&g,2,3,256,1,mac,0)==NNPI_NET_GATE_CAP_MISSING);
+    v.command_sizes[26]=1;
     /* Actual session planners + complete parser frames, one receiver to READY. */
     assert(nnpi_net_session_begin(&n,&nk,1,256));
     assert(nnpi_net_session_chan_op(&n,&nk,n.last_read+1,0,0,0,&plan));

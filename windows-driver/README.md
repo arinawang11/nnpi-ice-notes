@@ -12,10 +12,11 @@ The driver exposes a private device interface for:
 - a boot protocol used to load a card-side image over DMA;
 - a control-plane channel for Ethernet configuration between host and card.
 
-The data plane (frame TX/RX), IP configuration, SSH tunnelling and inference
-are outside this implementation. `READY` from the net control channel means
-the channel and page pools were acknowledged by the card, not that a network
-stack is operational.
+The driver implements the control plane and the RX/TX data ABI. The user-space
+bridge (`tools/nnpi-net-bridge.cpp`) connects the channel to a TAP-Windows6
+adapter. Whether SSH becomes reachable still depends on the card-side image
+and its network configuration; the driver alone does not provide a network
+stack.
 
 ## Layout
 
@@ -33,8 +34,9 @@ driver/
   nnpi_info.vcxproj
 include/              shared ABI and protocol headers
 tools/
-  nnpi-info.cpp       diagnostics CLI
-tests/                offline C11/C++17 unit tests
+  nnpi-info.cpp         diagnostics CLI
+  nnpi-net-bridge.cpp   TAP bridge (data plane)
+tests/                  offline C11/C++17 unit tests
 ```
 
 ## Build
@@ -44,6 +46,18 @@ Requirements: Visual Studio 2022, Windows 11 SDK/WDK, KMDF.
 ```powershell
 msbuild nnpi-host.sln /p:Configuration=Release /p:Platform=x64
 ```
+
+The bridge needs the official `tap-windows.h` from the OpenVPN
+tap-windows6 project. Point `NnpiTapIncludeDir` at the directory containing
+it:
+
+```powershell
+msbuild tools\nnpi-net-bridge.vcxproj /p:Configuration=Release /p:Platform=x64 `
+        /p:NnpiTapIncludeDir=C:\path\to\tap-windows6\include
+```
+
+No TAP ioctl numbers are copied into this repository; the header must come
+from the upstream project.
 
 The projects have signing disabled (`SignMode=Off`). A test certificate and
 `pnputil /add-driver` are required for installation; both are environment
@@ -60,6 +74,15 @@ tests\run-tests.cmd
 
 Run from an x64 Visual Studio developer prompt. The script compiles each test
 with `/W4 /WX` and executes it; any failure aborts.
+
+The bridge has a separate mock test that needs no adapter or device:
+
+```sh
+g++ -std=c++17 -Wall -Wextra -I include -o test_bridge tools/tests/test_bridge.cpp
+./test_bridge
+```
+
+It prints `BRIDGE_MOCK_TESTS_PASS` on success.
 
 ## Behaviour and safety
 

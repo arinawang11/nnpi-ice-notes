@@ -31,7 +31,8 @@ static inline uint32_t nnpi_net_control_gate(const struct nnpi_net_gate *g,
         generation!=g->boot_generation || epoch!=g->boot_epoch)
         return NNPI_NET_GATE_NOT_READY;
     if (!g->version || g->version->channel_version!=0x04c0 ||
-        g->version->response_sizes[7]!=1 || g->version->command_sizes[25]!=2)
+        g->version->response_sizes[7]!=1 || g->version->command_sizes[25]!=2 ||
+        g->version->response_sizes[8]!=1 || g->version->command_sizes[26]!=1)
         return NNPI_NET_GATE_CAP_MISSING;
     if (mac) for (i=0;i<6;++i) any|=mac[i];
     if (!ip || !mac || !any || (mac[0]&1) || (channel && channel!=256))

@@ -27,6 +27,7 @@
 #include "../include/nnpi_boot_session.h"
 #include "../include/nnpi_net_abi.h"
 #include "../include/nnpi_runtime_info_abi.h"
+#include "../include/nnpi_net_data_abi.h"
 #include <cstring>
 #include <iomanip>
 #include <algorithm>
@@ -1348,7 +1349,94 @@ int runRuntimeInfoCommand(int argc, wchar_t** argv) {
     return runtimeInfoOutput(static_cast<size_t>(index), result);
 }
 
+int runNetDataCommand(int argc, wchar_t** argv) {
+    const bool observe=std::wcscmp(argv[1],L"net-data-query")==0;
+    const char* usage="Usage: net-data-query --index N | net-tx --index N --session-id S --generation G --epoch E --frame-hex HEX (one explicit submission; no retry)";
+    if (argc!=(observe?4:12) || std::wcscmp(argv[2],L"--index")) return error("arguments",usage,2);
+    uint64_t index=0; nnpi_net_tx_request request{};
+    request.version=NNPI_NET_DATA_VERSION; request.size=sizeof(request);
+    try {
+        index=decimal64(argv[3]);
+        if (!observe) {
+            if (std::wcscmp(argv[4],L"--session-id") || std::wcscmp(argv[6],L"--generation") ||
+                std::wcscmp(argv[8],L"--epoch") || std::wcscmp(argv[10],L"--frame-hex")) return error("arguments",usage,2);
+            request.session_id=decimal64(argv[5]); request.generation=decimal64(argv[7]); request.epoch=decimal64(argv[9]);
+            if (!netIdentity(request.session_id) || !netIdentity(request.generation) || !netIdentity(request.epoch))
+                return error("arguments","TX requires current nonzero session/G/E",2);
+            const std::wstring hex(argv[11]);
+            if (hex.size()<28 || hex.size()>8192 || hex.size()%2) return error("arguments","Frame must be 14..4096 hex-encoded bytes",2);
+            auto digit=[](wchar_t ch)->int { if(ch>=L'0' && ch<=L'9') return ch-L'0';
+                if(ch>=L'a' && ch<=L'f') return ch-L'a'+10; if(ch>=L'A' && ch<=L'F') return ch-L'A'+10; return -1; };
+            request.length=static_cast<uint32_t>(hex.size()/2);
+            for(size_t i=0;i<request.length;++i) {
+                int hi=digit(hex[i*2]),lo=digit(hex[i*2+1]);
+                if(hi<0 || lo<0) return error("arguments","Frame contains non-hex characters",2);
+                request.frame[i]=static_cast<uint8_t>((hi<<4)|lo);
+            }
+        }
+    } catch (const std::runtime_error&) { return error("arguments",usage,2); }
+    BasicQueryResult<nnpi_net_data_response> data;
+    BasicQueryResult<nnpi_net_tx_response> tx;
+    try {
+        const auto paths=enumerateInterfaces();
+        if(index>=paths.size()) return error("arguments","--index is outside the current interface enumeration",2);
+        const Handle device(CreateFileW(paths[static_cast<size_t>(index)].c_str(),GENERIC_READ|(observe?0:GENERIC_WRITE),
+            FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,nullptr));
+        if(device.get()==INVALID_HANDLE_VALUE) throw Win32Failure{"CreateFileW(net-data)",GetLastError()};
+        if(observe) data=query<nnpi_net_data_response,nnpi_net_data_request>(device.get(),NNPI_NET_DATA_QUERY_IOCTL,NNPI_NET_DATA_VERSION);
+        else tx=query<nnpi_net_tx_response,nnpi_net_tx_request>(device.get(),NNPI_NET_TX_IOCTL,NNPI_NET_DATA_VERSION,&request);
+    } catch (const Win32Failure& f) {
+        if(observe) { data.code=f.code; data.operation=f.operation; }
+        else { tx.code=f.code; tx.operation=f.operation; }
+    }
+    const bool valid=observe ? data.code==ERROR_SUCCESS && nnpi_net_data_response_valid(&data.response,data.bytes) :
+        tx.code==ERROR_SUCCESS && tx.bytes==sizeof(tx.response) && tx.response.version==NNPI_NET_DATA_VERSION &&
+        tx.response.size==sizeof(tx.response) && tx.response.session_id==request.session_id &&
+        tx.response.generation==request.generation && tx.response.epoch==request.epoch && tx.response.accepted==1 &&
+        tx.response.slot<16 && !tx.response.reserved[0] && !tx.response.reserved[1];
+    std::ostringstream out; out.imbue(std::locale::classic());
+    out << "{\"ok\":" << (valid?"true":"false") << ",\"valid_response\":" << (valid?"true":"false")
+        << ",\"command\":" << jsonString(observe?"net-data-query":"net-tx") << ",\"index\":" << index
+        << ",\"cache_only\":" << (observe?"true":"false") << ",\"retry_allowed\":false,\"ssh_verified\":false"
+        << ",\"bytes_returned\":" << (observe?data.bytes:tx.bytes)
+        << ",\"timed_out\":" << ((observe?data.timedOut:tx.timedOut)?"true":"false");
+    if (!valid) {
+        out << ",\"error\":";
+        DWORD code=observe?data.code:tx.code;
+        if(code!=ERROR_SUCCESS) appendWin32(out,observe?data.operation:tx.operation,code);
+        else out << "{\"kind\":\"invalid_response\"}";
+    } else if(observe) {
+        const auto& r=data.response;
+        out << ",\"version\":" << r.version << ",\"size\":" << r.size
+            << ",\"session_id\":" << jsonString(std::to_string(r.session_id))
+            << ",\"generation\":" << jsonString(std::to_string(r.generation))
+            << ",\"epoch\":" << jsonString(std::to_string(r.epoch));
+#define NNPI_DATA_JSON(name) out << ",\"" #name "\":" << jsonString(std::to_string(r.name))
+        NNPI_DATA_JSON(rx_received); NNPI_DATA_JSON(rx_bytes); NNPI_DATA_JSON(rx_dropped);
+        NNPI_DATA_JSON(rx_bad_length); NNPI_DATA_JSON(rx_ack_sent); NNPI_DATA_JSON(tx_submitted);
+        NNPI_DATA_JSON(tx_acked); NNPI_DATA_JSON(invalid_descriptor); NNPI_DATA_JSON(unknown_ack);
+        NNPI_DATA_JSON(duplicate_rx); NNPI_DATA_JSON(fifo_full);
+#undef NNPI_DATA_JSON
+        out << ",\"rx_ack_pending\":" << r.rx_ack_pending << ",\"tx_busy\":" << r.tx_busy
+            << ",\"tx_pending\":" << r.tx_pending << ",\"rx_queued\":" << r.rx_queued
+            << ",\"fault_retained\":" << (r.fault_retained?"true":"false")
+            << ",\"last_emit_halves\":" << r.last_emit_halves
+            << ",\"interpretation\":\"cached page ownership; bounded RX queue has no Windows network consumer\"";
+    } else {
+        const auto& r=tx.response;
+        out << ",\"version\":" << r.version << ",\"size\":" << r.size
+            << ",\"session_id\":" << jsonString(std::to_string(r.session_id))
+            << ",\"generation\":" << jsonString(std::to_string(r.generation))
+            << ",\"epoch\":" << jsonString(std::to_string(r.epoch))
+            << ",\"accepted\":true,\"slot\":" << r.slot
+            << ",\"interpretation\":\"queued only; wait for real card ACK; never automatically retry\"";
+    }
+    out << '}'; return emit(out.str(),valid?0:1);
+}
+
 int run(int argc, wchar_t** argv) {
+    if (argc>1 && (std::wcscmp(argv[1],L"net-data-query")==0 || std::wcscmp(argv[1],L"net-tx")==0))
+        return runNetDataCommand(argc,argv);
     if (argc > 1 && std::wcscmp(argv[1], L"runtime-info") == 0)
         return runRuntimeInfoCommand(argc, argv);
     if (argc>1 && (std::wcscmp(argv[1],L"net-query")==0 ||

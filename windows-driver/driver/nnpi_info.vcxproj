@@ -41,7 +41,7 @@
       <SpecifyDriverVerDirectiveDate>true</SpecifyDriverVerDirectiveDate>
       <DateStamp>09/20/2026</DateStamp>
       <SpecifyDriverVerDirectiveVersion>true</SpecifyDriverVerDirectiveVersion>
-      <TimeStamp>15.4.45.211</TimeStamp>
+      <TimeStamp>15.4.45.213</TimeStamp>
     </Inf>
   </ItemDefinitionGroup>
   <ItemGroup><ClCompile Include="driver.c" /><ClCompile Include="nnpi_hw.c" /><ClCompile Include="nnpi_dma.c" /><ClCompile Include="nnpi_reset.c" /><ClCompile Include="nnpi_image.c" /><ClCompile Include="nnpi_net_dma.c" /><ClCompile Include="nnpi_irq.c" /></ItemGroup>

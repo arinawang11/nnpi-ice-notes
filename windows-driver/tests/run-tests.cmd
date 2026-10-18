@@ -15,6 +15,7 @@ for %%T in (
   test_runtime_protocol test_chan_protocol test_eth_protocol test_net_session
   test_fifo_halves test_net_abi test_runtime_transport test_irq_policy
   test_pnp_policy test_runtime_info_abi test_runtime_dispatch test_net_control
+  test_net_data
 ) do (
   call :one %%T c11
   if errorlevel 1 exit /b 1

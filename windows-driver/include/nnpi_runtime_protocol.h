@@ -81,6 +81,7 @@ static inline uint32_t nnpi_runtime_message_qwords(uint32_t opcode)
     case 4u: return 1u; /* EVENT_REPORT, retained raw, NOT success */
     case 11u: return 1u; /* SYS_INFO, retained raw, NOT success */
     case 39u: return 1u; /* ETH_CONFIG, route only after a complete frame. */
+    case 40u: return 1u; /* ETH_MSG_DSCR: frame or slot ACK, independent route. */
     default: return 0u; /* BIOS and channels are outside this finite parser. */
     }
 }
