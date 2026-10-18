@@ -75,3 +75,32 @@ Windows 文件系统的大小写和权限差异。构建要点：
 - 内存与 `/tmp` 空间有限，部署大型运行时前需确认剩余空间；
 - 无包管理器与网络安装源，软件必须以离线包形式提供；
 - 重启后所有运行时修改消失，需要重新部署。
+
+## 6. 实际运行画面
+
+下面这张截图来自卡端的 Xvfb 桌面，左边是两次 neofetch，右边是 CPU-X 4.5.1：
+
+![卡端 neofetch 与 CPU-X](images/card-neofetch-cpux.png)
+
+两次 neofetch 是两次不同的启动：一次 uptime 13 分钟、内存占用 315 MiB，
+另一次 uptime 20 小时 19 分钟、占用 1681 MiB。两次都显示 4 个线程、
+15,370 MiB 总内存，CPU 型号字符串是 `Intel Nervana NNP-I-1150 (4)
+@ 1.500GHz`。
+
+频率有三组数字，含义不同：
+
+- neofetch 的 `1.500GHz` 来自型号字符串，不是实时频率；
+- CPU-X 的 `Specification` 里是 `@ 0.80GHz`，来自 CPUID 的品牌串；
+- CPU-X 显示的 `Core Speed` 是 495 MHz，倍频 x4.9，总线 100.75 MHz。
+
+最后这一组是运行时读数，和前面说的约 500 MHz 限制一致。前两个是字符串
+里的标称值，不能当实时频率用。
+
+CPU-X 的缓存和指令集信息：L1D 2 x 48 KiB、12 路；L1I 2 x 32 KiB、8 路；
+L2 2 x 512 KiB、8 路；L3 24 MiB、24 路。指令集包含 AVX-512、AVX2、FMA3、
+AES、SHA、VT-x 等。界面里 `Code Name` 显示 `Broadwell-U (Core i7)`，
+和 DMI 里的 `IceLake I M.2` 对不上。识别卡型时以 DMI 信息和 CPUID 原始
+型号为准，不要用这一行。
+
+截图中还能看到 Xvfb + twm + xterm 的实际效果。卡端没有物理显示输出，
+这些窗口是通过 x11vnc 看到的。

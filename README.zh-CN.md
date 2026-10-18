@@ -48,7 +48,8 @@ geometry、credit、状态消息、start。引擎会接受 start，idle 标志�
 源码或二进制。
 
 `docs/` 是笔记：架构、实验记录、固件核查、主机环境、卡端运行环境、
-排错，还有主机侧迁到 Windows 需要做哪些事。
+排错，还有主机侧迁到 Windows 需要做哪些事。完整启动链，包括每个阶段
+驱动做了什么，在 [`docs/boot-chain.zh-CN.md`](docs/boot-chain.zh-CN.md)。
 
 `experiments/pytorch-cpu/` 是卡端 CPU 运行时的部署脚本。
 

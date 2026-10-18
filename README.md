@@ -56,7 +56,9 @@ vendor source or binaries.
 
 `docs/` has the notes: architecture, the experiment log, the firmware audit,
 host setup, the card runtime, troubleshooting, and a write-up of what moving
-the host side to Windows involves.
+the host side to Windows involves. The boot sequence is described end to end,
+including what the driver does at each stage, in
+[`docs/boot-chain.md`](docs/boot-chain.md).
 
 `experiments/pytorch-cpu/` is the deployment path for the CPU runtime.
 
