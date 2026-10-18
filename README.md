@@ -530,6 +530,8 @@ host setup, the card runtime, troubleshooting, and a write-up of what moving
 the host side to Windows involves.
 
 `experiments/pytorch-cpu/` is the deployment path for the CPU runtime.
+`experiments/iscsi-ram-lun/` is an iSCSI RAM LUN that gives CrystalDiskMark a
+normal block device, used to benchmark the host-side storage path.
 
 ## Building the driver
 

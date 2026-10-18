@@ -409,6 +409,8 @@ nnpi-net-bridge.exe --device-instance 'PCI\VEN_8086&DEV_45C6&SUBSYS_...' \
 排错，还有主机侧迁到 Windows 需要做哪些事。
 
 `experiments/pytorch-cpu/` 是卡端 CPU 运行时的部署脚本。
+`experiments/iscsi-ram-lun/` 是用 CrystalDiskMark 给主机存储路径跑分的
+iSCSI RAM LUN。
 
 ## 编译驱动
 

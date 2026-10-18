@@ -1,0 +1,12 @@
+select disk 9
+convert dynamic
+select disk 11
+convert dynamic
+select disk 12
+convert dynamic
+select disk 13
+convert dynamic
+select disk 9
+create volume stripe disk=9,11,12,13
+assign letter=G
+format fs=ntfs quick label=NNPI4WAY
