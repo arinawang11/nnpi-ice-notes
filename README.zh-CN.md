@@ -406,7 +406,9 @@ nnpi-net-bridge.exe --device-instance 'PCI\VEN_8086&DEV_45C6&SUBSYS_...' \
 源码或二进制。
 
 `docs/` 是笔记：架构、实验记录、固件核查、主机环境、卡端运行环境、
-排错，还有主机侧迁到 Windows 需要做哪些事。
+排错，还有主机侧迁到 Windows 需要做哪些事。[卡端访问主机磁盘的可行性](docs/storage-mapping.md)
+单独写了一篇，分层说明块级服务、钉页窗口和直接访问内存这三条路各自能
+走到哪。
 
 `experiments/pytorch-cpu/` 是卡端 CPU 运行时的部署脚本。
 `experiments/iscsi-ram-lun/` 是用 CrystalDiskMark 给主机存储路径跑分的
