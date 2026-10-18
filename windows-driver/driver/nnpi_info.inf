@@ -1,0 +1,59 @@
+; SPDX-License-Identifier: GPL-2.0-only
+; Build with matching Windows 11 x64 SDK/WDK. No automatic installation.
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider=%Provider%
+DriverVer=09/20/2026,15.4.45.211
+CatalogFile=nnpi_info.cat
+PnpLockdown=1
+
+[Manufacturer]
+%Provider%=Models,NTamd64.10.0...22000
+
+[Models.NTamd64.10.0...22000]
+%DeviceDesc%=Install,PCI\VEN_8086&DEV_45C6
+
+[DestinationDirs]
+DriverCopy=13
+
+[SourceDisksNames]
+1=%DiskName%,,,
+
+[SourceDisksFiles]
+nnpi_info.sys=1
+
+[Install.NT]
+CopyFiles=DriverCopy
+
+[DriverCopy]
+nnpi_info.sys
+
+[Install.NT.HW]
+AddReg=DeviceSecurity
+
+[DeviceSecurity]
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+[Install.NT.Services]
+AddService=nnpi_info,0x00000002,Service
+
+[Service]
+DisplayName=%ServiceDesc%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\nnpi_info.sys
+
+[Install.NT.Wdf]
+KmdfService=nnpi_info,WdfSection
+
+[WdfSection]
+KmdfLibraryVersion=$KMDFVERSION$
+
+[Strings]
+Provider="ICE Lab"
+DeviceDesc="NNPI Host Resource Information (No Compute)"
+ServiceDesc="NNPI Host Resource Information Driver"
+DiskName="NNPI resource-only experimental driver package"

@@ -45,10 +45,28 @@
 docs/
   hardware-notes.md     平台架构、命令模型与逆向结论（高层）
   experiment-log.md     实验记录：方法、结果与否定的假设
+  verdict.md            逆向可行性判定与证据边界
+  firmware-audit.md     固件载荷核查：范围、格式与缺失输入
+  host-setup.md         Windows 主机驱动安装、TAP 桥接与 SSH
+  card-runtime.md       卡端 Buildroot 运行时、图形环境与持久化
+  windows-migration.md  主机管理面迁移到 Windows 的分层方案
+  troubleshooting.md    频率、MSR、X11、WSL、MMIO 读回等故障排查
   pytorch-cpu.md        卡端 PyTorch/ONNX Runtime 运行时说明
+windows-driver/
+  driver/               自研 KMDF 驱动源码（GPL-2.0-only）
+  include/              共享 ABI 与协议头
+  tools/                诊断 CLI
+  tests/                离线 C11/C++17 单元测试
 experiments/
   pytorch-cpu/          部署脚本与一致性校验脚本
 ```
+
+## Windows 主机驱动
+
+`windows-driver/` 是对 `8086:45c6` 主机接口的独立 KMDF 实现，提供只读
+资源查询、镜像引导协议和控制面以太通道。它不包含厂商驱动源码或固件，
+不实现帧数据面、IP 配置、SSH 隧道或推理。构建需要 VS2022 与 WDK；
+安装需要测试签名或自备证书，INF 将访问限制为 SYSTEM 与管理员。
 
 ## 未包含的内容
 
@@ -65,4 +83,4 @@ experiments/
 
 本项目为独立互操作研究，与 Intel 无关联。所有实验在自有硬件上进行，
 以不损坏设备为前提。仓库内容按现状提供，不构成任何担保。请勿将本文档
-用于规避供应商许可或获取未授权固件。
+用于规避供应商许可或分发受限制的固件。

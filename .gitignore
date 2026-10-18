@@ -10,6 +10,20 @@
 *.tgz
 *.zip
 
+# windows build products
+*.sys
+*.exe
+*.dll
+*.obj
+*.pdb
+*.ilk
+*.cat
+*.tlog
+*.lastbuildstate
+*.recipe
+build/
+test-results-*/
+
 # local runtime trees
 py/
 site/

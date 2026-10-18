@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{73FE0F58-8964-4D6B-BDCA-D1543DCD4542}</ProjectGuid>
+    <RootNamespace>nnpi_info</RootNamespace>
+    <WindowsTargetPlatformVersion>$(NnpiWdkVersion)</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>KMDF</DriverType>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <TargetVersion>Windows10</TargetVersion>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+    <KmdfVersion>$(NnpiKmdfVersion)</KmdfVersion>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <DriverSignMode>Off</DriverSignMode>
+    <SignMode>Off</SignMode>
+    <EnableInf2Cat>false</EnableInf2Cat>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(ProjectDir)..\build\$(Platform)\$(Configuration)\driver\</OutDir>
+    <IntDir>$(ProjectDir)..\build\obj\$(Platform)\$(Configuration)\driver\</IntDir>
+    <TargetName>nnpi_info</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>POOL_NX_OPTIN=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link><AdditionalDependencies>Cng.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+    <Inf>
+      <SpecifyDriverVerDirectiveDate>true</SpecifyDriverVerDirectiveDate>
+      <DateStamp>09/20/2026</DateStamp>
+      <SpecifyDriverVerDirectiveVersion>true</SpecifyDriverVerDirectiveVersion>
+      <TimeStamp>15.4.45.211</TimeStamp>
+    </Inf>
+  </ItemDefinitionGroup>
+  <ItemGroup><ClCompile Include="driver.c" /><ClCompile Include="nnpi_hw.c" /><ClCompile Include="nnpi_dma.c" /><ClCompile Include="nnpi_reset.c" /><ClCompile Include="nnpi_image.c" /><ClCompile Include="nnpi_net_dma.c" /><ClCompile Include="nnpi_irq.c" /></ItemGroup>
+  <ItemGroup><ClInclude Include="nnpi_image.h" /><ClInclude Include="..\include\nnpi_boot_abi.h" /><ClInclude Include="..\include\nnpi_boot_session.h" /><ClInclude Include="..\include\nnpi_runtime_protocol.h" /></ItemGroup>
+  <ItemGroup><Inf Include="nnpi_info.inf" /></ItemGroup>
+  <ItemGroup><ClInclude Include="..\include\nnpi_info_abi.h" /><ClInclude Include="..\include\nnpi_interface.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="nnpi_hw.h" /><ClInclude Include="..\include\nnpi_diag_abi.h" /><ClInclude Include="..\include\nnpi_bar_match.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="..\include\nnpi_status_abi.h" /><ClInclude Include="..\include\nnpi_status_policy.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="..\include\nnpi_snapshot_abi.h" /><ClInclude Include="..\include\nnpi_snapshot_policy.h" /><ClInclude Include="..\include\nnpi_fifo_protocol.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="nnpi_dma.h" /><ClInclude Include="..\include\nnpi_dmacheck_abi.h" /><ClInclude Include="..\include\nnpi_dmacheck_policy.h" /><ClInclude Include="..\include\nnpi_boot_protocol.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="..\include\nnpi_resetcaps_abi.h" /><ClInclude Include="..\include\nnpi_resetcaps_policy.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="nnpi_reset.h" /><ClInclude Include="..\include\nnpi_reset_abi.h" /><ClInclude Include="..\include\nnpi_reset_policy.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="..\include\nnpi_hostready.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="nnpi_net_dma.h" /><ClInclude Include="..\include\nnpi_net_abi.h" /><ClInclude Include="..\include\nnpi_net_session.h" /><ClInclude Include="..\include\nnpi_chan_protocol.h" /><ClInclude Include="..\include\nnpi_eth_protocol.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="nnpi_irq.h" /><ClInclude Include="..\include\nnpi_irq_policy.h" /><ClInclude Include="..\include\nnpi_runtime_transport.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="..\include\nnpi_pnp_policy.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="..\include\nnpi_boot_experiment.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="..\include\nnpi_runtime_info_abi.h" /><ClInclude Include="..\include\nnpi_runtime_dispatch.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="..\include\nnpi_net_control.h" /></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="ValidateExplicitKit" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(Platform)'!='x64'" Text="Only Windows 11 x64 is in scope." />
+    <Error Condition="'$(NnpiWdkVersion)'==''" Text="Specify /p:NnpiWdkVersion from inventory; no implicit latest kit." />
+    <Error Condition="'$(NnpiKmdfVersion)'==''" Text="Specify /p:NnpiKmdfVersion from the installed WDK." />
+    <Error Condition="'$(WindowsTargetPlatformVersion)'!='$(NnpiWdkVersion)'" Text="SDK and WDK target versions must match." />
+  </Target>
+</Project>

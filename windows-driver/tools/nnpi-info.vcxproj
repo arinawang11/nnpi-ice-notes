@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{AF664BEC-FB5A-4B06-B888-1DC176CE2AD6}</ProjectGuid>
+    <RootNamespace>nnpi_info_cli</RootNamespace>
+    <WindowsTargetPlatformVersion>$(NnpiWdkVersion)</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(ProjectDir)..\build\$(Platform)\$(Configuration)\tools\</OutDir>
+    <IntDir>$(ProjectDir)..\build\obj\$(Platform)\$(Configuration)\tools\</IntDir>
+    <TargetName>nnpi-info</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel><TreatWarningAsError>true</TreatWarningAsError>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link><SubSystem>Console</SubSystem><AdditionalDependencies>setupapi.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+  </ItemDefinitionGroup>
+  <ItemGroup><ClCompile Include="nnpi-info.cpp" /></ItemGroup>
+  <ItemGroup><ClInclude Include="..\include\nnpi_diag_abi.h" /><ClInclude Include="..\include\nnpi_bar_match.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="..\include\nnpi_status_abi.h" /><ClInclude Include="..\include\nnpi_status_policy.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="..\include\nnpi_snapshot_abi.h" /><ClInclude Include="..\include\nnpi_snapshot_policy.h" /><ClInclude Include="..\include\nnpi_fifo_protocol.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="..\include\nnpi_dmacheck_abi.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="..\include\nnpi_resetcaps_abi.h" /></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="ValidateExplicitKit" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(Platform)'!='x64'" Text="Only Windows 11 x64 is in scope." />
+    <Error Condition="'$(NnpiWdkVersion)'==''" Text="Specify /p:NnpiWdkVersion from inventory." />
+  </Target>
+</Project>
