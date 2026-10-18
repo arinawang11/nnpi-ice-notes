@@ -398,6 +398,42 @@ nnpi-net-bridge.exe --device-instance 'PCI\VEN_8086&DEV_45C6&SUBSYS_...' \
 寄存器偏移、位域表、厂商源码、固件、启动镜像和私钥都没有放进仓库。
 这份说明解释启动链的阶段和驱动职责，不是带地址的操作手册。
 
+## 启动一个通用 Linux
+
+卡侧启动代理不关心镜像里装的是什么。它按 DMA 读 181 块，校验主机写进去的
+SEAL 头，然后跳到入口。厂商镜像里碰巧是 Buildroot initramfs 和 Intel 的
+工具，那只是载荷，不是启动条件。
+
+为了验证这一点，我用 Alpine minirootfs 和厂商内核树编出来的同一个 5.7.0
+内核做了一个镜像。大小还是 188,744,192 字节：MBR、一个 0xEF 分区、FAT16，
+`bzImage` 和 `EFI/BOOT/bootx64.efi` 是同一个文件。initramfs 里是原样的
+Alpine 用户空间，加上从卡端镜像拿来的 `sphcs.ko`。它的 init 挂 proc、sys、
+dev，加载模块，然后等待。
+
+驱动同时放行两个镜像的 SHA-256，实际跑法是：
+
+```
+nnpi-info boot-load   --index 0 --generation 1 --epoch 1 --image generic-alpine.img
+nnpi-info boot-submit --index 0 --session <id> --generation 1 --epoch 1
+nnpi-info boot-query  --index 0
+```
+
+门铃在十秒左右从 1 走到 10、3、4，`boot-query` 报 `phase=9
+driver_ready=1`。接着 `net-begin` 建好以太网通道，卡端回了 ETH_CONFIG。
+在 TAP 网卡上起 `nnpi-net-bridge` 之后，`ping 192.168.115.2` 6/6 通，
+TTL 64。
+
+有两个坑花了不少时间：
+
+- 白名单不只编进驱动，也编进了用户态工具。只重编 SYS 的话，`boot-load`
+  会在本地就把新镜像拒掉，根本还没碰设备（`chunks_sent: 0`）。
+- 桥接程序没起来时 ping 是不通的。TAP 网卡和地址照样在，`ipconfig`
+  看着一切正常，但帧根本没到卡上。
+
+这说明启动路径与载荷无关，普通发行版内核也能在卡上跑起来。现在还不是一个
+可登录的系统：这个镜像没有 sshd 或 telnetd，而且仍然整个跑在 initramfs 里。
+下一步是做磁盘根文件系统和远程登录。
+
 ## 仓库里有什么
 
 `windows-driver/` 是我自己写的 KMDF 驱动，针对 `45c6` 这个 function，

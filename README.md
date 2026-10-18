@@ -518,6 +518,46 @@ Register offsets, bit-field tables, vendor source, firmware, boot images and
 private keys are not in this repository. What is here stops at stages and
 driver responsibilities; it is not an address-level operations manual.
 
+## Booting a stock Linux
+
+The card-side boot agent does not care what the image contains. It reads 181
+chunks over DMA, checks the SEAL header the host wrote, and jumps to the entry
+point. The vendor image happens to carry a Buildroot initramfs and the Intel
+tools; that is a payload, not a requirement.
+
+To test that, I built an image around an Alpine minirootfs and the same 5.7.0
+kernel that the vendor tree builds. It is 188,744,192 bytes: an MBR, one 0xEF
+partition, FAT16, with `bzImage` and `EFI/BOOT/bootx64.efi` being the same
+file. The initramfs holds the stock Alpine userland plus `sphcs.ko` from the
+card image. Its init mounts proc, sys and dev, loads the module, and waits.
+
+With both images on the driver's SHA-256 allowlist, the run was:
+
+```
+nnpi-info boot-load   --index 0 --generation 1 --epoch 1 --image generic-alpine.img
+nnpi-info boot-submit --index 0 --session <id> --generation 1 --epoch 1
+nnpi-info boot-query  --index 0
+```
+
+The doorbell moved 1 -> 10 -> 3 -> 4 in about ten seconds and `boot-query`
+reported `phase=9 driver_ready=1`. `net-begin` then created the Ethernet
+channel, and the card acknowledged ETH_CONFIG. With `nnpi-net-bridge` running
+on the TAP adapter, `ping 192.168.115.2` answers 6/6 with TTL 64.
+
+Two things cost time and are worth writing down:
+
+- The allowlist is compiled into the user-mode tool as well as into the
+  driver. Rebuilding only the SYS makes `boot-load` reject the new image
+  locally, before any device I/O (`chunks_sent: 0`).
+- Ping goes nowhere until `nnpi-net-bridge` is running. The TAP adapter and
+  its address exist regardless, so `ipconfig` looks fine while the frames
+  never reach the card.
+
+This shows the boot path is payload-agnostic and that an ordinary
+distribution kernel runs on the card. It is not yet a shell: this image has
+no sshd or telnetd, and everything still runs from initramfs. A disk-backed
+root and a remote login are the next step.
+
 ## What is in the repo
 
 `windows-driver/` is my own KMDF driver for the `45c6` function, plus a small

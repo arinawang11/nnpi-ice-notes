@@ -137,3 +137,32 @@ DiskSpd 交叉验证（4K QD32，`-Sh` 无缓存）：写 59,249 IOPS /
 设备已被 `LogoutTarget` 拒绝，不影响 `G:`；保留进程只为避开重连风暴。
 换卡侧后端需要新的卡端 MEM_READ/MEM_WRITE verb、主机侧通道和 IOCTL，
 按轮次单独授权；可行性分层见 [storage-mapping.md](storage-mapping.md)。
+
+## 9. 卡端启动通用 Linux（2026-10-19）
+
+之前对卡端镜像的判断是：它就是一个普通的 Linux 载荷，启动代理只认 181
+块 DMA 和 SEAL 头。这一轮把判断变成了实测。
+
+镜像用 Alpine minirootfs 加厂商内核树编译的 5.7.0 内核：188,744,192
+字节，MBR + 单个 0xEF 分区，FAT16，`bzImage` 与
+`EFI/BOOT/bootx64.efi` 内容相同。initramfs 里保留 Alpine 的 busybox
+用户空间和 `sphcs.ko`，init 只做挂载、`insmod` 和等待。
+
+驱动 0.3.0.21 的允许列表同时保留厂商镜像和这个通用镜像的 SHA-256。
+`boot-load` 送完 181 块，`boot-submit` 后门铃从 1 到 10、3、4，
+十秒内 `phase=9 driver_ready=1`。`net-begin --card-ip 192.168.115.2
+--mac 02:4e:4e:50:01:02` 建好通道，主机收到 ETH_CONFIG 回显；
+`nnpi-net-bridge` 接上 TAP 后 ping 6/6，TTL 64。
+
+两处必须一起改，否则会误判：
+
+1. `nnpi_image_identity.h` 同时被驱动和 `nnpi-info` 使用。只重编 SYS
+   时，`nnpi-info boot-load` 会在本地校验就拒绝新镜像，返回
+   `chunks_sent: 0`，设备状态一点没动。
+2. 只发 `net-begin` 不够。TAP 网卡和 `192.168.115.1` 地址一直都在，
+   但没有桥接进程，ARP 出不了主机。表现为 ping 100% 丢失，而
+   `net-query` 一侧 `chan_created=1`、`eth_configured=1` 全部正常。
+
+这个镜像没有 sshd/telnetd，根文件系统仍在 initramfs 里。要拿到可登录的
+系统，下一步得做磁盘根和远程登录，这也正好是驱动需要重构的部分：
+卡端要能读主机磁盘或 VHDX。
