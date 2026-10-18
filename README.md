@@ -527,9 +527,13 @@ vendor source or binaries.
 
 `docs/` has the notes: architecture, the experiment log, the firmware audit,
 host setup, the card runtime, troubleshooting, and a write-up of what moving
-the host side to Windows involves.
+the host side to Windows involves. [Storage mapping](docs/storage-mapping.md)
+is separate: it lays out the three levels of card-to-host disk access and what
+each one actually buys.
 
 `experiments/pytorch-cpu/` is the deployment path for the CPU runtime.
+`experiments/iscsi-ram-lun/` is an iSCSI RAM LUN that gives CrystalDiskMark a
+normal block device, used to benchmark the host-side storage path.
 
 ## Building the driver
 
