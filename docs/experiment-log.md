@@ -93,3 +93,47 @@ START 后整页差分只有 8~12 个寄存器变化，且每次运行数值完�
 - TLC 固件的 UOW 派发协议（本地无任何映射）。
 
 以上项目在获得权威资料（固件或供应商文档）之前不做猜测性写入。
+
+## 8. 主机侧存储路径跑分（2026-10-19）
+
+目标不是测内存，而是先把“CrystalDiskMark 能对加速器存储路径打分”这件事
+做成可复用的装置。后端先放主机 RAM；等卡端 MEM 通道可用，只换后端，
+盘符、卷和 CDM 自动化都不动。
+
+拓扑：用户态 C# iSCSI target（RAM LUN，512 MiB/路）→ Windows 原生
+iSCSI Initiator → 四块盘转动态盘 → 2 GiB 条带卷 `G:`（`NNPI4WAY`）。
+四路各绑一个回环地址（`127.0.0.1`..`.4`），IQN 分别用 `ram9`、`ram11`、
+`ram12`、`ram13`，共用 3260。CDM 9.0.3，测试规模 256 MiB。
+
+CDM 实测（MB/s）：
+
+| 项目 | 单会话 | 四路条带 |
+| --- | --- | --- |
+| SEQ1M Q8T1 读 | 3412.69 | 4645.99 |
+| SEQ1M Q8T1 写 | 3059.09 | 3771.37 |
+| SEQ1M Q1T1 读 | 3184.52 | 4226.78 |
+| SEQ1M Q1T1 写 | 2882.09 | 3328.51 |
+| RND4K Q32T1 读 | 155.30 | 285.51 |
+| RND4K Q32T1 写 | 145.72 | 245.51 |
+| RND4K Q1T1 读 | 131.10 | 122.21 |
+| RND4K Q1T1 写 | 116.39 | 106.13 |
+
+DiskSpd 交叉验证（4K QD32，`-Sh` 无缓存）：写 59,249 IOPS /
+231.44 MiB/s，读 69,742 IOPS / 272.43 MiB/s；1M 顺序 QD8 读 4329、
+写 3629 MiB/s。顺序读写已经超过 Gen3 x4 的 3.94 GB/s。
+
+瓶颈不在 target。四路 RND4K QD32 压测采样 10 秒：DiskSpd 约 97% 单核，
+四个 target 各约 32%。CDM 的 RND4K 固定单线程、队列深度 32，先把客户端
+吃满，再加盘没有收益；扩到六路后 4K 读 69,789 IOPS、顺序读 4345 MiB/s，
+与四路一致。Q1T1 反而略降，因为单队列没有并行度可分，条带只多一层定位
+开销。
+
+协议与 Windows 侧的 14 个坑、target 的热路径优化和回退方案都记在
+[experiments/iscsi-ram-lun/README.md](../experiments/iscsi-ram-lun/README.md)，
+这里不重复。目录里同时保留了可以直接点 CDM 的 `run-test.ps1`、
+`results.ps1` 和四路 `diskpart-4way.txt`。
+
+当前 `127.0.0.5`/`.6` 上还留着两个已注销失败的会话（`ram14`/`ram15`），
+设备已被 `LogoutTarget` 拒绝，不影响 `G:`；保留进程只为避开重连风暴。
+换卡侧后端需要新的卡端 MEM_READ/MEM_WRITE verb、主机侧通道和 IOCTL，
+按轮次单独授权；可行性分层见 [storage-mapping.md](storage-mapping.md)。
