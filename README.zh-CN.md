@@ -414,6 +414,32 @@ nnpi-net-bridge.exe --device-instance 'PCI\VEN_8086&DEV_45C6&SUBSYS_...' \
 `experiments/iscsi-ram-lun/` 是用 CrystalDiskMark 给主机存储路径跑分的
 iSCSI RAM LUN。
 
+## 存储路径跑分
+
+CrystalDiskMark 只认普通块设备，所以把 PCIe function 藏在一个小的 iSCSI
+target 后面：四个 RAM LUN、四条 Windows 会话、一个动态盘条带卷（`G:`，
+`NNPI4WAY`）。CDM 9.0.3，256 MiB：
+
+| 项目 | 单会话 | 四路条带 |
+| --- | --- | --- |
+| SEQ1M Q8T1 读 | 3412.69 MB/s | 4645.99 MB/s |
+| SEQ1M Q8T1 写 | 3059.09 MB/s | 3771.37 MB/s |
+| SEQ1M Q1T1 读 | 3184.52 MB/s | 4226.78 MB/s |
+| SEQ1M Q1T1 写 | 2882.09 MB/s | 3328.51 MB/s |
+| RND4K Q32T1 读 | 155.30 MB/s | 285.51 MB/s |
+| RND4K Q32T1 写 | 145.72 MB/s | 245.51 MB/s |
+| RND4K Q1T1 读 | 131.10 MB/s | 122.21 MB/s |
+| RND4K Q1T1 写 | 116.39 MB/s | 106.13 MB/s |
+
+顺序读写已经超过 Gen3 x4 的上限。RND4K Q32T1 接近翻倍，但瓶颈在客户端：
+CDM 的随机测试只有一条线程、队列深度 32，会吃满一个核，所以扩到五路、
+六路没有收益（六路 4K 读 69,789 IOPS，顺序读 4345 MiB/s）。Q1T1 不会涨，
+单队列没有并行度可分。
+
+同一块卷和脚本以后可以直接指向卡侧内存后端，只改 target 的读写路径。
+协议细节和 14 个 Windows 侧的坑在 `experiments/iscsi-ram-lun/README.md`，
+按时间记录在 `docs/experiment-log.md`。
+
 ## 编译驱动
 
 需要 Visual Studio 2022 和 Windows 11 WDK，机器上得插着卡。在 x64 开发

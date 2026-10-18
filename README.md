@@ -535,6 +535,34 @@ each one actually buys.
 `experiments/iscsi-ram-lun/` is an iSCSI RAM LUN that gives CrystalDiskMark a
 normal block device, used to benchmark the host-side storage path.
 
+## Storage path benchmark
+
+CrystalDiskMark only talks to a block device, so the PCIe function is hidden
+behind a small iSCSI target: four RAM LUNs, four Windows sessions, one
+dynamic-disk stripe (`G:`, `NNPI4WAY`). CDM 9.0.3, 256 MiB:
+
+| Test | One session | Four-way stripe |
+| --- | --- | --- |
+| SEQ1M Q8T1 read | 3412.69 MB/s | 4645.99 MB/s |
+| SEQ1M Q8T1 write | 3059.09 MB/s | 3771.37 MB/s |
+| SEQ1M Q1T1 read | 3184.52 MB/s | 4226.78 MB/s |
+| SEQ1M Q1T1 write | 2882.09 MB/s | 3328.51 MB/s |
+| RND4K Q32T1 read | 155.30 MB/s | 285.51 MB/s |
+| RND4K Q32T1 write | 145.72 MB/s | 245.51 MB/s |
+| RND4K Q1T1 read | 131.10 MB/s | 122.21 MB/s |
+| RND4K Q1T1 write | 116.39 MB/s | 106.13 MB/s |
+
+Sequential throughput passes the Gen3 x4 ceiling. RND4K Q32T1 nearly doubles,
+but the limit is the client: CDM's random test is one thread at queue depth 32
+and pins about one core, so five or six targets add nothing (six-way: 69,789
+IOPS read, 4345 MiB/s sequential). Q1T1 does not improve because one queue has
+nothing to stripe.
+
+The same volume and scripts can later point at a card-side memory backend;
+only the target's read/write path changes. Protocol notes and 14 Windows-side
+pitfalls are in `experiments/iscsi-ram-lun/README.md`; the dated entry is in
+`docs/experiment-log.md`.
+
 ## Building the driver
 
 You need Visual Studio 2022 with the Windows 11 WDK, and a card in the
