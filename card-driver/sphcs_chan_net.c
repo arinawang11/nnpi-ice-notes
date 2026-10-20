@@ -77,7 +77,7 @@ static struct delayed_work s_c2h_reap_work;
 #define SPHCS_C2H_ACK_TIMEOUT_MS	2000
 /* Do not reuse a slot immediately after its ACK; this absorbs duplicate ACKs
  * before the slot can be handed to a new frame. */
-#define SPHCS_C2H_QUARANTINE_MS		20
+#define SPHCS_C2H_QUARANTINE_MS		1
 static uint8_t      *s_c2h_busy_handles;
 
 static struct net_device_stats *sphcs_net_dev_get_stats(struct net_device *dev)
@@ -203,7 +203,7 @@ static void sphcs_net_c2h_reap_work(struct work_struct *work)
 		return;
 	NNP_SPIN_LOCK_BH(&s_net_cmd_chan->c2h_rb[0].lock_bh);
 	sphcs_net_c2h_reap();
-	if (sphcs_net_c2h_free_slots() > 4)
+	if (sphcs_net_c2h_free_slots() > 2)
 		wake = 1;
 	NNP_SPIN_UNLOCK_BH(&s_net_cmd_chan->c2h_rb[0].lock_bh);
 	if (wake && netif_queue_stopped(s_net_dev)) {
@@ -224,7 +224,6 @@ static int sphcs_net_dev_start_xmit(struct sk_buff *skb, struct net_device *netd
 	u32 skb_size = skb->len;
 	u32 skb_size_aligned;
 	u32 skb_data_offset;
-	int stop_q = 0;
 	int c2h_skb_handle;
 	dma_addr_t write_host_dma_addr;
 	uint32_t cont;
@@ -265,17 +264,9 @@ static int sphcs_net_dev_start_xmit(struct sk_buff *skb, struct net_device *netd
 		s_c2h_done_jiffies[c2h_skb_handle] = 0;
 		break;
 	}
-	if (c2h_skb_handle < s_c2h_handles && sphcs_net_c2h_free_slots() <= 2)
-		stop_q = 1;
 	NNP_SPIN_UNLOCK_BH(&s_net_cmd_chan->c2h_rb[0].lock_bh);
-	if (stop_q) {
-		netif_stop_queue(netdev);
-		schedule_delayed_work(&s_c2h_reap_work, msecs_to_jiffies(500));
-	}
 
 	if (c2h_skb_handle >= s_c2h_handles) {
-		netif_stop_queue(netdev);
-		schedule_delayed_work(&s_c2h_reap_work, msecs_to_jiffies(500));
 		sph_log_err(ETH_LOG, "SPH_NET - c2h ringbuffer full\n");
 		s_net_dev->stats.tx_dropped++;
 		kfree_skb(skb);
@@ -584,7 +575,7 @@ static void netmsg_op_work_handler(struct work_struct *work)
 		if (h < (unsigned int)s_c2h_handles && s_c2h_busy_handles[h]) {
 			s_c2h_busy_handles[h] = 0;
 			s_c2h_free_jiffies[h] = jiffies;
-			if (sphcs_net_c2h_free_slots() > 4)
+			if (sphcs_net_c2h_free_slots() > 2)
 				wake = 1;
 		} else {
 			/* Duplicate/invalid ACK: never index outside the array. */
