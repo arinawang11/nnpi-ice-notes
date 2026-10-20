@@ -65,16 +65,18 @@ def main():
     if not ko.exists():
         sys.exit("sphcs.ko was not produced")
 
-    # 2. Stage the initramfs.
+    # 2. Stage the initramfs. The rootfs is copied first so the builder's init
+    # and freshly built module always take precedence over rootfs copies.
     stage = work / "initramfs"
     if stage.exists():
         shutil.rmtree(stage)
-    (stage / "lib" / "modules").mkdir(parents=True)
+    stage.mkdir(parents=True)
+    if args.rootfs:
+        shutil.copytree(Path(args.rootfs).resolve(), stage, dirs_exist_ok=True)
+    (stage / "lib" / "modules").mkdir(parents=True, exist_ok=True)
     shutil.copy2(init_src, stage / "init")
     os.chmod(stage / "init", 0o755)
     shutil.copy2(ko, stage / "lib" / "modules" / "sphcs.ko")
-    if args.rootfs:
-        shutil.copytree(Path(args.rootfs).resolve(), stage, dirs_exist_ok=True)
 
     # 3. Rebuild the kernel with the initramfs embedded.
     if not args.skip_kernel_build:

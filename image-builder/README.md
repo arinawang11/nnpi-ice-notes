@@ -17,6 +17,8 @@ Builds a bootable NNP-I card image for a **user-supplied Linux kernel**:
   `CONFIG_BLK_DEV_NBD`, `CONFIG_EXT4_FS`, and the x86_64 bzImage target.
 - The initramfs needs a shell and `nbd-client` (and optionally `rawtun`)
   for the root transport; provide them via `--rootfs` or a custom `--init`.
+  `--rootfs` is copied first, then the builder's `init` and freshly built
+  `sphcs.ko` are placed on top, so they always win.
 
 ## Usage
 
