@@ -14,6 +14,21 @@ work to it (TLC, `cve_image*.bin`) is not in any image, driver package or
 archive I have. The x86 cores do run PyTorch, and that part works well
 enough to be useful.
 
+## Driver release status
+
+The community driver is being prepared for its first supported release
+(**NNPI Community Driver 1.0.0**; current development build 0.3.0.34):
+
+- host driver for Windows Server 2025 / Windows 11 24H2, x64, test-signed;
+- device class `Coprocessor` (project-defined class GUID);
+- card-side `sphcs` module (GPL-2.0-or-later) with an out-of-tree build for
+  vendor and generic kernels;
+- `image-builder/` to turn a user-supplied kernel into a card boot image.
+
+See `windows-driver/README.md` and `docs/release/` for install, safety, the
+release plan and the card-side root-cause notes. The remaining 1.0 blocker is
+hardware validation of the C2H handle-lifecycle fixes under sustained load.
+
 ## The hardware
 
 The card exposes two PCI functions. `8086:45c4` is the ICE interface on the

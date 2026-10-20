@@ -11,6 +11,19 @@
 （`cve_image*.bin`）在我手上的镜像、驱动包和归档里都找不到。x86 那边的
 PyTorch 倒是能正常用，而且速度不算差。
 
+## 驱动发布状态
+
+社区驱动正在准备第一个正式版本（**NNPI Community Driver 1.0.0**，当前开发版
+0.3.0.34）：
+
+- 宿主驱动：Windows Server 2025 / Windows 11 24H2，x64，测试签名；
+- 设备类别：`Coprocessor`（项目自有 class GUID）；
+- 卡端 `sphcs` 模块（GPL-2.0-or-later），支持 vendor 与通用内核的树外构建；
+- `image-builder/`：把用户提供的通用内核构建成卡端启动镜像。
+
+安装、安全、发布计划与卡端根因见 `windows-driver/README.md` 和
+`docs/release/`。1.0 剩下的门槛是 C2H 句柄生命周期修复的持续负载硬件验证。
+
 ## 硬件情况
 
 卡上有两个 PCI function。`8086:45c4` 是卡侧的 ICE 接口，`8086:45c6` 是
