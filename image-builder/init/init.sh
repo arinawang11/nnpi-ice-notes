@@ -5,6 +5,7 @@
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH LC_ALL=C
 
+mkdir -p /dev /proc /sys /tmp /run
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sysfs /sys 2>/dev/null
 mount -t devtmpfs devtmpfs /dev 2>/dev/null

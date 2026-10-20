@@ -107,3 +107,28 @@ Implemented in `card-driver/sphcs_chan_net.c`:
 Build validation: vendor 5.7 kernel tree and Ubuntu 5.4 headers (`ION_STUB=1`)
 both build `sphcs.ko` with no errors or warnings. Hardware stress validation
 and the 20 GB acceptance run are still required before 1.0.0.
+
+## 2026-10-20 hardware validation — C2H lifecycle fix
+
+Image: val5 (SHA-256 168892c5f476ef65513cc1adfdeb97ecbc79125f64b82c7d61fcd91b96b410c0),
+vendor 5.7 kernel + patched sphcs + Alpine initramfs; host driver 0.3.0.44.
+
+Test: the card boots the image, net-begin reaches READY, rawbridge serves a
+15 GiB sequential NBD read (`dd if=/dev/nbd0 of=/dev/null bs=1M count=15360`).
+
+Result: rc=0, marker `NNPISTRESS DONE rc=0` written at the disk tail; the card
+stayed in phase 9 (no reset/reboot), the host had no 0x80 NMI, no WHEA and no
+0x9F for the whole run. Throughput ~10.2 MB/s, duration ~24 minutes. This
+passes the old 7.3 GB failure point with margin.
+
+Notable finding: `netif_stop_queue` backpressure must not be used for this
+tunnel. ACK/control frames share the same TX queue, so stopping it starves the
+ACKs (observed 0.3-0.8 MB/s, `inflight` pinned at the window). The validated
+module keeps the bounds check, a 1 ms slot quarantine, the 2 s lost-ACK reaper
+and the DMA-failure ACK, and drops when the ring is full.
+
+Still open for 1.0: a teardown after the 600 s boot timeout (phase 8
+WAIT_DRIVER) was followed by 0x80 NMIs (17:38, 18:12, 18:50, 19:54, 20:01).
+The bounded 0x9F waits likely let the WDF cleanup free/reset DMA while the card
+was still active. Do not free DMA on an unresolved boot; keep the device
+faulted and defer cleanup.

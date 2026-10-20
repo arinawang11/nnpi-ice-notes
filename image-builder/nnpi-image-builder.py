@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--rootfs", help="directory merged into the initramfs")
     ap.add_argument("--out", required=True, help="output image path")
     ap.add_argument("--ion-stub", action="store_true", help="build the ION symbol stubs")
+    ap.add_argument("--module-ko", help="use a prebuilt sphcs.ko instead of building")
     ap.add_argument("--skip-kernel-build", action="store_true",
                     help="reuse the existing bzImage (initramfs not re-embedded)")
     ap.add_argument("--workdir", help="keep intermediate files in this directory")
@@ -54,16 +55,22 @@ def main():
     work = Path(args.workdir) if args.workdir else Path(tempfile.mkdtemp(prefix="nnpi-image-"))
     work.mkdir(parents=True, exist_ok=True)
 
-    # 1. Build the module from a private copy (keeps the source tree clean).
-    module = work / "card-driver"
-    if module.exists():
-        shutil.rmtree(module)
-    shutil.copytree(module_src, module)
-    run(["make", "-C", module, "KDIR=" + str(kernel),
-         "ION_STUB=" + ("1" if args.ion_stub else "0")])
-    ko = module / "sphcs.ko"
-    if not ko.exists():
-        sys.exit("sphcs.ko was not produced")
+    # 1. Build the module from a private copy (keeps the source tree clean),
+    #    unless a prebuilt module was supplied for an A/B or vendor build.
+    if args.module_ko:
+        ko = Path(args.module_ko).resolve()
+        if not ko.exists():
+            sys.exit("prebuilt module not found: " + str(ko))
+    else:
+        module = work / "card-driver"
+        if module.exists():
+            shutil.rmtree(module)
+        shutil.copytree(module_src, module)
+        run(["make", "-C", module, "KDIR=" + str(kernel),
+             "ION_STUB=" + ("1" if args.ion_stub else "0")])
+        ko = module / "sphcs.ko"
+        if not ko.exists():
+            sys.exit("sphcs.ko was not produced")
 
     # 2. Stage the initramfs. The rootfs is copied first so the builder's init
     # and freshly built module always take precedence over rootfs copies.
@@ -72,9 +79,24 @@ def main():
         shutil.rmtree(stage)
     stage.mkdir(parents=True)
     if args.rootfs:
-        shutil.copytree(Path(args.rootfs).resolve(), stage, dirs_exist_ok=True)
+        # cp -a preserves device nodes; /dev, /proc and /sys are mounted by
+        # the init and must not be baked into the initramfs.
+        run(["cp", "-a", str(Path(args.rootfs).resolve()) + "/.", str(stage)])
+        for name in ("dev", "proc", "sys"):
+            target = stage / name
+            if target.exists():
+                subprocess.run(["rm", "-rf", str(target)], check=True)
+    # The kernel opens /dev/console before init runs, and the init mounts
+    # devtmpfs on /dev. Both need these mount points to exist in the image.
+    for name in ("dev", "proc", "sys", "tmp", "run"):
+        (stage / name).mkdir(parents=True, exist_ok=True)
     (stage / "lib" / "modules").mkdir(parents=True, exist_ok=True)
-    shutil.copy2(init_src, stage / "init")
+    # A UTF-8 BOM or CRLF in the shebang makes the kernel fail to exec /init.
+    init_data = init_src.read_bytes()
+    if init_data.startswith(b"\xef\xbb\xbf"):
+        init_data = init_data[3:]
+    init_data = init_data.replace(b"\r\n", b"\n")
+    (stage / "init").write_bytes(init_data)
     os.chmod(stage / "init", 0o755)
     shutil.copy2(ko, stage / "lib" / "modules" / "sphcs.ko")
 
