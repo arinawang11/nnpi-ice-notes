@@ -9,7 +9,7 @@
  * Local structures are NOT an IOCTL ABI. Caller owns lifetime/serialization.
  * Qwords are host numeric values (convert little-endian bytes at transport).
  *
- * Sources (paths relative to the original vendor driver tree):
+ * Sources (relative to /home/arina/nnpi):
  * nnpi-drv-5.15/ipc_include/ipc_protocol.h:85-113,183-190 (masks/opcodes);
  * nnpi-card/card_driver/card/driver/host_interface/ipc_protocol.h:94-155
  * (legacy reply1/2 lengths and identical QW0); device.c:135-162 only handles
@@ -82,6 +82,7 @@ static inline uint32_t nnpi_runtime_message_qwords(uint32_t opcode)
     case 11u: return 1u; /* SYS_INFO, retained raw, NOT success */
     case 39u: return 1u; /* ETH_CONFIG, route only after a complete frame. */
     case 40u: return 1u; /* ETH_MSG_DSCR: frame or slot ACK, independent route. */
+    case 41u: return 3u; /* Bulk v1: gated by reviewed image + channel size tables. */
     default: return 0u; /* BIOS and channels are outside this finite parser. */
     }
 }

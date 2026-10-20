@@ -68,7 +68,7 @@ public:
     Backend& backend; Identity id; Queue toNet{}, toTap{};
     std::array<Op, LaneCount> ops{}; Stats stats{};
     bool claimed = false, running = false, stopped = false;
-    uint64_t nextTx = 0, nextRx = 0;
+    uint64_t nextTx = 0;
     explicit Engine(Backend& b, Identity i) : backend(b), id(i) {}
     ~Engine() { stop(); }
     bool begin() {
@@ -92,7 +92,7 @@ public:
             if (!backend.poll(static_cast<Lane>(i), op)) {
                 // An idle TAP read is expected. A stuck TX/write/control is fatal;
                 // its disposition is unknown and it is NEVER replayed.
-                if (i != TapRead && now - op.started >= 5000) {
+                if (i != TapRead && i != NetRx && now - op.started >= 5000) {
                     if (i == NetTx) ++stats.uncertainTx;
                     fail(); return false;
                 }
@@ -100,7 +100,7 @@ public:
             }
             op.active = false;
             if (op.error) {
-                if (i == NetTx && op.error == Busy) { ++stats.busy; nextTx = now + 2; continue; }
+                if (i == NetTx && op.error == Busy) { ++stats.busy; nextTx = now; continue; }
                 if (i == NetTx) ++stats.uncertainTx;
                 fail(); return false;
             }
@@ -135,7 +135,7 @@ public:
                     if (f.length < 14) { ++stats.shortDrops; continue; }
                     toTap.push(f.frame, f.length); ++stats.rxFrames; stats.rxBytes += f.length;
                 }
-                nextRx = now + (r.count ? 0 : 2);
+                if (!r.count) { fail(); return false; } // wait ABI never returns empty success
             } else {
                 if (op.bytes != toTap.front().size) { fail(); return false; }
                 ++stats.tapWritten; stats.tapWrittenBytes += op.bytes; toTap.pop();
@@ -150,7 +150,7 @@ public:
             r.length = toNet.front().size; std::memcpy(r.frame, toNet.front().data.data(), r.length);
             ops[NetTx].input(r); ops[NetTx].outBytes = sizeof(nnpi_net_tx_response); submit(NetTx, now);
         }
-        if (!ops[NetRx].active && toTap.free() && now >= nextRx) {
+        if (!ops[NetRx].active && toTap.free()) {
             nnpi_net_rx_batch_request r{}; bind(r, id, NNPI_NET_RX_VERSION);
             r.max_frames = static_cast<uint32_t>((std::min)(toTap.free(), size_t(NNPI_NET_RX_QUEUE_DEPTH)));
             ops[NetRx].input(r); ops[NetRx].outBytes = sizeof(nnpi_net_rx_batch_response); submit(NetRx, now);
@@ -361,7 +361,7 @@ struct WinBackend {
         ResetEvent(ov.hEvent); BOOL ok; DWORD bytes = 0;
         if (lane == TapRead) ok = ReadFile(tap.value, op.out.data(), op.outBytes, &bytes, &ov);
         else if (lane == TapWrite) ok = WriteFile(tap.value, op.in.data(), op.inBytes, &bytes, &ov);
-        else ok = DeviceIoControl(net.value, lane == NetTx ? NNPI_NET_TX_IOCTL : NNPI_NET_RX_BATCH_IOCTL,
+        else ok = DeviceIoControl(net.value, lane == NetTx ? NNPI_NET_TX_IOCTL : NNPI_NET_RX_WAIT_IOCTL,
             op.in.data(), op.inBytes, op.out.data(), op.outBytes, &bytes, &ov);
         op.bytes = bytes;
         const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
@@ -387,13 +387,21 @@ struct WinBackend {
             ops[i].bytes = bytes; pending[i] = false;
         }
     }
-    void wait(const std::array<Op, LaneCount>& ops) {
+    void wait(const std::array<Op, LaneCount>& ops, uint64_t nextTx, bool txQueued) {
         HANDLE handles[LaneCount + 1]{}; DWORD count = 1; handles[0] = stop.value;
         for (size_t i = 0; i < LaneCount; ++i) {
             if (ops[i].active && !pending[i]) return; // immediate completion
             if (pending[i]) handles[count++] = events[i].value;
         }
-        WaitForMultipleObjects(count, handles, FALSE, 2);
+        const uint64_t now = GetTickCount64();
+        uint64_t timeout = INFINITE;
+        for (size_t i : {size_t(NetTx), size_t(TapWrite)}) if (ops[i].active) {
+            const uint64_t due = ops[i].started + 5000;
+            timeout = (std::min)(timeout, due > now ? due - now : uint64_t(0));
+        }
+        if (txQueued && !ops[NetTx].active)
+            timeout = (std::min)(timeout, nextTx > now ? nextTx - now : uint64_t(0));
+        WaitForMultipleObjects(count, handles, FALSE, static_cast<DWORD>(timeout));
     }
 };
 uint64_t number(const std::wstring& s) {
@@ -410,7 +418,7 @@ int run(int argc, wchar_t** argv) {
     if (argc == 2 && !std::wcscmp(argv[1], L"--help")) {
         std::puts("nnpi-net-bridge --device-instance <PCI-instance-ID> --tap-guid <{GUID}> --session <u64> --generation <u64> --epoch <u64>\n"
             "Requires a separately installed, configured, verified official TAP adapter. No installation, IP configuration, Boot/Net close, reset or payload logging.\n"
-            "Acceptance target: Windows TAP 192.0.2.1 -> card 192.0.2.2, NOT localhost. Ctrl+C cancels/drains IO then releases claim.");
+            "Acceptance target: Windows TAP 192.168.115.1 -> card 192.168.115.2, NOT localhost. Ctrl+C cancels/drains IO then releases claim.");
         return 0;
     }
     std::wstring instance, guid; Identity id{}; unsigned seen = 0;
@@ -445,7 +453,7 @@ int run(int argc, wchar_t** argv) {
         std::wprintf(L"device_instance=%ls tap_guid=%ls session=%llu generation=%llu epoch=%llu\n",
             instance.c_str(), guid.c_str(), id.session, id.generation, id.epoch);
         while (WaitForSingleObject(backend.stop.value, 0) == WAIT_TIMEOUT && engine.tick(GetTickCount64()))
-            backend.wait(engine.ops);
+            backend.wait(engine.ops, engine.nextTx, engine.toNet.count != 0);
     }
     engine.stop();
     const auto& s = engine.stats;

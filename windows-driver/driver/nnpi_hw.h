@@ -5,6 +5,7 @@
 #include <wdf.h>
 #include "../include/nnpi_status_policy.h"
 #include "../include/nnpi_snapshot_policy.h"
+#include "../include/nnpi_hostwin_policy.h"
 #include "../include/nnpi_runtime_transport.h"
 /* Intentionally NOT an alias of NNPI_SNAPSHOT_MAPPING. Commands can only use
  * the mapping owned by NnpiMapSysinfo, whose base is BAR0+0x050. */
@@ -66,4 +67,19 @@ NTSTATUS NnpiReadRuntime(NNPI_SNAPSHOT_MAPPING *Mapping, uint64_t Words[16], ULO
 NTSTATUS NnpiQueryVersion(NNPI_COMMAND_MAPPING *Mapping, struct nnpi_runtime_query_state *State);
 NTSTATUS NnpiRuntimeHostReady(NNPI_SNAPSHOT_MAPPING *Mapping);
 NTSTATUS NnpiRuntimeKeepalive(NNPI_SNAPSHOT_MAPPING *Mapping, ULONG *Counter);
+/* Card host-window (CPU-Z inventory) mapped at BAR2+offset. Shared window: the
+ * card writes with the C2H magic and the host reads it; the host writes with the
+ * H2C magic and the card reads it. One mapping, two directions. */
+typedef struct _NNPI_HOSTWIN_MAPPING {
+    PVOID Address;
+    uint32_t Reason;
+} NNPI_HOSTWIN_MAPPING;
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID NnpiMapHostwin(const struct nnpi_diag_response *Diagnostic, NNPI_HOSTWIN_MAPPING *Mapping);
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID NnpiUnmapHostwin(NNPI_HOSTWIN_MAPPING *Mapping);
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS NnpiReadHostwin(NNPI_HOSTWIN_MAPPING *Mapping, struct nnpi_hostwin_response *Response);
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS NnpiWriteHostwin(NNPI_HOSTWIN_MAPPING *Mapping, const struct nnpi_hostwin_write_request *Request, uint32_t *WrittenBytes);
 #endif

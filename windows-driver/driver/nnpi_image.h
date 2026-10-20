@@ -5,7 +5,8 @@
 #include <wdf.h>
 #include "../include/nnpi_boot_protocol.h"
 
-#define NNPI_IMAGE_BYTES 188744192u
+#include "../include/nnpi_image_identity.h"
+#define NNPI_IMAGE_BYTES ((size_t)NNPI_APPROVED_IMAGE_BYTES)
 #define NNPI_IMAGE_CHUNK_BYTES (1024u * 1024u)
 #define NNPI_IMAGE_ALIGNMENT (NNPI_BOOT_PAGE_SIZE - 1u)
 #define NNPI_IMAGE_CHUNK_COUNT \

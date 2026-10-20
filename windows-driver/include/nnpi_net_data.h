@@ -4,14 +4,15 @@
 #include <string.h>
 #include "nnpi_eth_protocol.h"
 #include "nnpi_net_data_abi.h"
+#define NNPI_NET_CPU_RX_CAPACITY 32u
 /* CacheLock serializes all state, page copies and command publication. No heap,
  * MMIO or DMA lifetime authority here. RX stores only CPU-owned frame copies. */
 struct nnpi_net_data {
     struct nnpi_eth_slots tx;
     uint16_t tx_pending, tx_sent, rx_pending;
     uint32_t rx_head;
-    uint16_t tx_lengths[NNPI_ETH_SLOTS], rx_lengths[NNPI_NET_RX_QUEUE_DEPTH];
-    uint8_t rx_frames[NNPI_NET_RX_QUEUE_DEPTH][NNPI_ETH_PAGE_BYTES];
+    uint16_t tx_lengths[NNPI_ETH_SLOTS], rx_lengths[NNPI_NET_CPU_RX_CAPACITY];
+    uint8_t rx_frames[NNPI_NET_CPU_RX_CAPACITY][NNPI_ETH_PAGE_BYTES];
     struct nnpi_net_data_response stats;
 };
 static inline void nnpi_net_data_inc(uint64_t *v) { if (*v!=UINT64_MAX) ++*v; }
@@ -63,8 +64,8 @@ static inline int nnpi_net_data_receive(struct nnpi_net_data *d,uint8_t slot,
         nnpi_net_data_inc(&d->stats.rx_received);
         if (UINT64_MAX-d->stats.rx_bytes<length) d->stats.rx_bytes=UINT64_MAX;
         else d->stats.rx_bytes+=length;
-        if (d->stats.rx_queued<NNPI_NET_RX_QUEUE_DEPTH) {
-            uint32_t tail=(d->rx_head+d->stats.rx_queued)%NNPI_NET_RX_QUEUE_DEPTH;
+        if (d->stats.rx_queued<NNPI_NET_CPU_RX_CAPACITY) {
+            uint32_t tail=(d->rx_head+d->stats.rx_queued)%NNPI_NET_CPU_RX_CAPACITY;
             memcpy(d->rx_frames[tail],page,length);
             d->rx_lengths[tail]=length; ++d->stats.rx_queued;
         } else {
@@ -89,10 +90,13 @@ static inline void nnpi_net_data_dequeue(struct nnpi_net_data *d,uint32_t max_fr
         memcpy(out->frames[i].frame,d->rx_frames[head],d->rx_lengths[head]);
         memset(d->rx_frames[head],0,sizeof(d->rx_frames[head]));
         d->rx_lengths[head]=0;
-        d->rx_head=(head+1u)%NNPI_NET_RX_QUEUE_DEPTH;
+        d->rx_head=(head+1u)%NNPI_NET_CPU_RX_CAPACITY;
         --d->stats.rx_queued;
     }
-    out->count=n; out->remaining=d->stats.rx_queued;
+    out->count=n;
+    /* Legacy batch ABI: bounded availability hint, not total CPU queue depth. */
+    out->remaining=d->stats.rx_queued>NNPI_NET_RX_QUEUE_DEPTH ?
+        NNPI_NET_RX_QUEUE_DEPTH:d->stats.rx_queued;
 }
 static inline int nnpi_net_data_next(struct nnpi_net_data *d,uint16_t channel,
     uint64_t *qw,uint8_t *slot,int *ack)

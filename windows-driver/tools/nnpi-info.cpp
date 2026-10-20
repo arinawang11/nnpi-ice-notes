@@ -28,9 +28,14 @@
 #include "../include/nnpi_net_abi.h"
 #include "../include/nnpi_runtime_info_abi.h"
 #include "../include/nnpi_net_data_abi.h"
+#include "../include/nnpi_perf_abi.h"
+#include "../include/nnpi_maintenance.h"
+#include "../include/nnpi_hostwin_abi.h"
 #include <cstring>
 #include <iomanip>
 #include <algorithm>
+#include <fstream>
+#include <iterator>
 
 #include <cstdio>
 #include <cstdlib>
@@ -61,6 +66,13 @@ static_assert(NNPI_RUNTIME_INFO_IOCTL == 0x80006050U, "RUNTIME INFO must remain 
 static_assert(sizeof(void*) == 8, "Build this tool for Windows x64");
 static_assert(sizeof(nnpi_info_request) == 16, "Request ABI mismatch");
 static_assert(sizeof(nnpi_info_response) == 576, "Response ABI mismatch");
+
+static_assert(sizeof(nnpi_hostwin_request) == 16, "HOSTWIN request ABI mismatch");
+static_assert(sizeof(nnpi_hostwin_response) == 32 + NNPI_HOSTWIN_SIZE, "HOSTWIN response ABI mismatch");
+static_assert(NNPI_HOSTWIN_QUERY_IOCTL == 0x80006080U, "HOSTWIN must remain buffered/read-only function 0x820");
+static_assert(NNPI_HOSTWIN_WRITE_IOCTL == 0x8000A084U, "HOSTWIN WRITE must remain buffered/write function 0x821");
+static_assert(sizeof(nnpi_hostwin_write_request) == 8 + 4 + 12 + NNPI_HOSTWIN_DATA_MAX, "HOSTWIN write request ABI mismatch");
+static_assert(sizeof(nnpi_hostwin_write_response) == 32, "HOSTWIN write response ABI mismatch");
 
 namespace {
 constexpr DWORD kWaitMilliseconds = 5000;
@@ -745,6 +757,169 @@ int runSysinfo(HANDLE device, const char* command, size_t index, const std::stri
     out << '}'; return emit(out.str(),valid ? 0 : 1);
 }
 
+// HOSTWIN is read-only, cache-only: the card's CPU-Z inventory is copied from the
+// BAR2 window by the driver; this tool renders it. It never emits DMA addresses,
+// file paths or firmware-derived fields, only the bounded text blob the card wrote.
+int runHostwin(HANDLE device, const char* command, size_t index, const std::string& path) {
+    const auto result = query<nnpi_hostwin_response, nnpi_hostwin_request>(
+        device, NNPI_HOSTWIN_QUERY_IOCTL, NNPI_HOSTWIN_VERSION);
+    const bool valid = result.code == ERROR_SUCCESS &&
+        nnpi_hostwin_response_valid(&result.response, result.bytes);
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << "{\"ok\":" << (valid ? "true" : "false")
+        << ",\"command\":" << jsonString(command)
+        << ",\"index\":" << index
+        << ",\"interface_path\":" << jsonString(path)
+        << ",\"cache_only\":true,\"retry_allowed\":false"
+        << ",\"hardware_boot_verified\":false,\"compute_verified\":false,\"ssh_verified\":false";
+    if (!valid) {
+        out << ",\"valid_response\":false,\"bytes_returned\":" << result.bytes
+            << ",\"timed_out\":" << (result.timedOut ? "true" : "false") << ",\"error\":";
+        if (result.code != ERROR_SUCCESS) appendWin32(out, result.operation, result.code);
+        else {
+            out << "{\"kind\":\"invalid_response\",\"validator\":\"nnpi_hostwin_response_valid\"}";
+            /* Raw-window diagnostic: the driver copies the full 16 KiB BAR2
+             * window even when magic is invalid, so expose the head to tell
+             * "card never wrote" (all zero) from "wrote but not flushed". */
+            const auto& rr = result.response;
+            const uint8_t* w = reinterpret_cast<const uint8_t*>(rr.window);
+            auto le32 = [](const uint8_t* p) {
+                return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+                    (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+            };
+            std::ostringstream hex;
+            hex << std::hex << std::setfill('0');
+            for (size_t i = 0; i < 128 && i < sizeof(rr.window); ++i)
+                hex << std::setw(2) << static_cast<unsigned>(w[i]);
+            out << ",\"raw_magic\":\"0x" << std::hex << std::setfill('0') << std::setw(8)
+                << le32(w) << "\""
+                << ",\"raw_data_size\":\"0x" << std::setw(8) << le32(w + 4) << "\""
+                << ",\"raw_head_hex\":\"" << hex.str() << "\"" << std::dec;
+        }
+        if (result.cancelled) {
+            out << ",\"cancel_result\":";
+            appendWin32(out, "CancelIoEx", result.cancelCode);
+            out << ",\"final_completion\":";
+            appendWin32(out, "GetOverlappedResult(wait=TRUE)", result.completionCode);
+        }
+    } else {
+        const auto& r = result.response;
+        out << ",\"version\":" << r.version << ",\"size\":" << r.size
+            << ",\"generation\":" << jsonString(std::to_string(r.generation))
+            << ",\"reason\":" << r.reason
+            << ",\"magic_valid\":" << r.magic_valid
+            << ",\"data_size\":" << r.data_size
+            << ",\"read_bytes\":" << r.read_bytes
+            << ",\"window\":" << jsonString(std::string(
+                reinterpret_cast<const char*>(r.window) + 8, r.data_size));
+    }
+    out << '}'; return emit(out.str(), valid ? 0 : 1);
+}
+
+uint64_t decimal64(const wchar_t* text);
+
+int runHostwinCommand(int argc, wchar_t** argv) {
+    const char* usage = "Usage: nnpi-info hostwin-query --index N (zero-based; explicit selection required)";
+    if (argc != 4 || std::wcscmp(argv[2], L"--index"))
+        return error("arguments", usage, 2);
+    uint64_t index = 0;
+    try { index = decimal64(argv[3]); }
+    catch (const std::runtime_error&) {
+        return error("arguments", "hostwin-query --index must be an unsigned decimal uint64", 2);
+    }
+    try {
+        const auto paths = enumerateInterfaces();
+        if (index >= paths.size())
+            return error("arguments", "--index is outside the current interface enumeration", 2);
+        const std::string path = utf8(paths[static_cast<size_t>(index)]);
+        const Handle device(CreateFileW(paths[static_cast<size_t>(index)].c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr));
+        if (device.get() == INVALID_HANDLE_VALUE)
+            throw Win32Failure{"CreateFileW(hostwin-query read-only overlapped)", GetLastError()};
+        return runHostwin(device.get(), "hostwin-query", static_cast<size_t>(index), path);
+    } catch (const Win32Failure& failure) {
+        std::ostringstream out;
+        out.imbue(std::locale::classic());
+        out << "{\"ok\":false,\"command\":\"hostwin-query\",\"index\":" << index
+            << ",\"error\":";
+        appendWin32(out, failure.operation, failure.code);
+        out << ",\"hardware_boot_verified\":false,\"compute_verified\":false";
+        out << '}';
+        return emit(out.str(), 1);
+    }
+}
+
+// HOSTWIN WRITE is the host->card direction: the tool loads a UTF-8 report (the
+// Windows CPU-Z export) and the driver stamps it into the BAR2 window with the
+// H2C magic. The card reads it back. Bounded to NNPI_HOSTWIN_DATA_MAX; no path,
+// address or offset beyond the fixed window is ever emitted.
+int runHostwinWrite(HANDLE device, size_t index, const std::string& path, const std::string& content) {
+    nnpi_hostwin_write_request request{};
+    request.version = NNPI_HOSTWIN_VERSION;
+    request.size = (uint32_t)sizeof(request);
+    request.data_size = (uint32_t)(content.size() <= NNPI_HOSTWIN_DATA_MAX ? content.size() : NNPI_HOSTWIN_DATA_MAX);
+    if (request.data_size) std::memcpy(request.data, content.data(), request.data_size);
+    const auto result = queryBuffer<nnpi_hostwin_write_response>(
+        device, NNPI_HOSTWIN_WRITE_IOCTL, &request, (DWORD)sizeof(request));
+    const bool valid = result.code == ERROR_SUCCESS && result.bytes == sizeof(nnpi_hostwin_write_response) &&
+        result.response.version == NNPI_HOSTWIN_VERSION && result.response.size == sizeof(result.response) &&
+        result.response.reason == NNPI_HOSTWIN_OK && result.response.written_bytes == request.data_size;
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << "{\"ok\":" << (valid ? "true" : "false")
+        << ",\"command\":\"hostwin-write\",\"index\":" << index
+        << ",\"interface_path\":" << jsonString(path)
+        << ",\"cache_only\":false,\"retry_allowed\":false"
+        << ",\"hardware_boot_verified\":false,\"compute_verified\":false,\"ssh_verified\":false"
+        << ",\"report_bytes\":" << request.data_size;
+    if (!valid) {
+        out << ",\"valid_response\":false,\"bytes_returned\":" << result.bytes
+            << ",\"timed_out\":" << (result.timedOut ? "true" : "false") << ",\"error\":";
+        if (result.code != ERROR_SUCCESS) appendWin32(out, result.operation, result.code);
+        else out << "{\"kind\":\"invalid_response\",\"validator\":\"hostwin-write response\"}";
+    } else {
+        const auto& r = result.response;
+        out << ",\"generation\":" << jsonString(std::to_string(r.generation))
+            << ",\"reason\":" << r.reason << ",\"written_bytes\":" << r.written_bytes;
+    }
+    out << '}'; return emit(out.str(), valid ? 0 : 1);
+}
+
+int runHostwinWriteCommand(int argc, wchar_t** argv) {
+    const char* usage = "Usage: nnpi-info hostwin-write --index N --file PATH";
+    if (argc != 6 || std::wcscmp(argv[2], L"--index") || std::wcscmp(argv[4], L"--file"))
+        return error("arguments", usage, 2);
+    uint64_t index = 0;
+    try { index = decimal64(argv[3]); }
+    catch (const std::runtime_error&) {
+        return error("arguments", "hostwin-write --index must be an unsigned decimal uint64", 2);
+    }
+    try {
+        const auto paths = enumerateInterfaces();
+        if (index >= paths.size())
+            return error("arguments", "--index is outside the current interface enumeration", 2);
+        const std::string path = utf8(paths[static_cast<size_t>(index)]);
+        std::ifstream f(utf8(argv[5]), std::ios::binary);
+        if (!f) return error("arguments", "hostwin-write cannot open --file", 2);
+        const std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        const Handle device(CreateFileW(paths[static_cast<size_t>(index)].c_str(), GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr));
+        if (device.get() == INVALID_HANDLE_VALUE)
+            throw Win32Failure{"CreateFileW(hostwin-write write-only overlapped)", GetLastError()};
+        return runHostwinWrite(device.get(), static_cast<size_t>(index), path, content);
+    } catch (const Win32Failure& failure) {
+        std::ostringstream out;
+        out.imbue(std::locale::classic());
+        out << "{\"ok\":false,\"command\":\"hostwin-write\",\"index\":" << index
+            << ",\"error\":";
+        appendWin32(out, failure.operation, failure.code);
+        out << ",\"hardware_boot_verified\":false,\"compute_verified\":false";
+        out << '}';
+        return emit(out.str(), 1);
+    }
+}
+
 // BOOT never emits image bytes, file paths, DMA addresses, or inferred firmware fields.
 std::string bootDigest(const uint8_t* bytes) {
     constexpr char hex[] = "0123456789abcdef";
@@ -774,7 +949,7 @@ bool bootReplyValid(const nnpi_boot_response& r, DWORD bytes,
     if (r.load_state != NNPI_BOOT_LOAD_EMPTY &&
         (!bootIdentity(r.session_id) || !bootIdentity(r.generation) || !bootIdentity(r.epoch))) return false;
     if (r.sha256_verified && (r.loaded_bytes != NNPI_BOOT_IMAGE_BYTES ||
-        bootDigest(r.sha256) != NNPI_BOOT_SHA256_HEX)) return false;
+        !nnpi_image_identity_hex_matches(bootDigest(r.sha256).c_str()))) return false;
     if (ioctl == NNPI_BOOT_QUERY_IOCTL) return true;
     return bootIdentity(r.session_id) && r.generation == request.generation &&
         r.epoch == request.epoch &&
@@ -928,7 +1103,7 @@ int runBoot(HANDLE device, const char* command, size_t index, uint64_t session,
         uint8_t digest[32]{};
         if (BCryptFinishHash(hash.hash,digest,sizeof(digest),0)<0)
             return bootLocalError(progress,"cng","BCryptFinishHash failed");
-        if (bootDigest(digest)!=NNPI_BOOT_SHA256_HEX)
+        if (!nnpi_image_identity_hex_matches(bootDigest(digest).c_str()))
             return bootLocalError(progress,"image_hash","Boot image does not match the fixed SHA-256 allowlist");
         progress.localVerified=true;
         LARGE_INTEGER beginning{};
@@ -1434,7 +1609,80 @@ int runNetDataCommand(int argc, wchar_t** argv) {
     out << '}'; return emit(out.str(),valid?0:1);
 }
 
+int runPerfCommand(int argc,wchar_t** argv) {
+    if (argc!=4 || std::wcscmp(argv[2],L"--index")) return error("arguments","Usage: nnpi-info perf-query --index N",2);
+    uint64_t index;
+    try { index=decimal64(argv[3]); } catch (const std::runtime_error&) { return error("arguments","Invalid index",2); }
+    BasicQueryResult<nnpi_perf_response> result;
+    try {
+        const auto paths=enumerateInterfaces();
+        if (index>=paths.size()) return error("arguments","Index outside interface enumeration",2);
+        const Handle device(CreateFileW(paths[static_cast<size_t>(index)].c_str(),GENERIC_READ,
+            FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,nullptr));
+        if (device.get()==INVALID_HANDLE_VALUE) throw Win32Failure{"CreateFileW(perf-query read-only)",GetLastError()};
+        result=query<nnpi_perf_response,nnpi_perf_request>(device.get(),NNPI_PERF_QUERY_IOCTL,NNPI_PERF_VERSION);
+    } catch (const Win32Failure& f) { result.code=f.code; result.operation=f.operation; }
+    const auto& r=result.response;
+    const bool valid=result.code==ERROR_SUCCESS && result.bytes==sizeof(r) && r.version==NNPI_PERF_VERSION && r.size==sizeof(r) && r.qpc_frequency;
+    std::ostringstream out; out.imbue(std::locale::classic());
+    out << "{\"command\":\"perf-query\",\"cache_only\":true,\"ok\":" << (valid?"true":"false");
+    if (!valid) { out << ",\"error\":"; appendWin32(out,result.operation,result.code); }
+    else {
+#define PERF_JSON(name) out << ",\"" #name "\":" << jsonString(std::to_string(r.name))
+        PERF_JSON(qpc_frequency); PERF_JSON(wait_close); PERF_JSON(wait_work); PERF_JSON(wait_timeout); PERF_JSON(wait_error);
+        PERF_JSON(rounds); PERF_JSON(empty_rounds); PERF_JSON(bursts); PERF_JSON(burst_round_limit); PERF_JSON(burst_time_limit);
+        PERF_JSON(rx_qwords); PERF_JSON(ack_sent); PERF_JSON(tx_sent); PERF_JSON(fifo_full); PERF_JSON(pending_at_limit);
+        PERF_JSON(tx_enqueued); PERF_JSON(tx_latency_count); PERF_JSON(tx_latency_ticks); PERF_JSON(tx_latency_max); PERF_JSON(tx_pending_high_water);
+#undef PERF_JSON
+        out << ",\"wait_bins\":[";
+        for (unsigned i=0;i<5;++i) out << (i?",":"") << jsonString(std::to_string(r.wait_bins[i]));
+        out << "],\"lock_bins\":[";
+        for (unsigned i=0;i<5;++i) out << (i?",":"") << jsonString(std::to_string(r.lock_bins[i]));
+        out << "]";
+    }
+    out << '}'; return emit(out.str(),valid?0:1);
+}
+
+int runMaintenance(int argc,wchar_t** argv) {
+    const bool prepare=std::wcscmp(argv[1],L"maintenance-prepare")==0;
+    if (argc!=(prepare?12:4) || std::wcscmp(argv[2],L"--index") ||
+        (prepare && (std::wcscmp(argv[4],L"--session") || std::wcscmp(argv[6],L"--generation") ||
+         std::wcscmp(argv[8],L"--epoch") || std::wcscmp(argv[10],L"--attempt"))))
+        return error("arguments","maintenance-query --index N | maintenance-prepare --index N --session S --generation G --epoch E --attempt A",2);
+    nnpi_maintenance_request request{};
+    request.version=NNPI_MAINTENANCE_VERSION; request.size=sizeof(request);
+    const auto index=decimal64(argv[3]);
+    if (prepare) { request.session=decimal64(argv[5]); request.generation=decimal64(argv[7]);
+        request.epoch=decimal64(argv[9]); request.attempt=decimal64(argv[11]); }
+    const auto paths=enumerateInterfaces();
+    if(index>=paths.size()) return error("arguments","Index outside interface enumeration",2);
+    const Handle device(CreateFileW(paths[static_cast<size_t>(index)].c_str(),GENERIC_READ|(prepare?GENERIC_WRITE:0),
+        FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,nullptr));
+    if(device.get()==INVALID_HANDLE_VALUE) throw Win32Failure{"CreateFileW(maintenance)",GetLastError()};
+    const auto result=query<nnpi_maintenance_response,nnpi_maintenance_request>(device.get(),
+        prepare?NNPI_MAINTENANCE_PREPARE_IOCTL:NNPI_MAINTENANCE_QUERY_IOCTL,NNPI_MAINTENANCE_VERSION,&request);
+    const auto& r=result.response;
+    const bool valid=result.code==ERROR_SUCCESS && result.bytes==sizeof(r) &&
+        r.version==NNPI_MAINTENANCE_VERSION && r.size==sizeof(r) && r.state<=NNPI_MAINT_QUIESCED &&
+        (!prepare || (r.session==request.session && r.generation==request.generation && r.epoch==request.epoch && r.attempt==request.attempt));
+    std::ostringstream out; out.imbue(std::locale::classic());
+    out << "{\"command\":\"maintenance-" << (prepare?"prepare":"query") << "\",\"ok\":" << (valid?"true":"false")
+        << ",\"quiesced\":" << (valid && nnpi_maintenance_valid(&r)?"true":"false")
+        << ",\"hardware_flr_recovery_verified\":false";
+    if(valid) {
+#define MAINT_JSON(n) out << ",\"" #n "\":" << jsonString(std::to_string(r.n))
+        MAINT_JSON(session); MAINT_JSON(generation); MAINT_JSON(epoch); MAINT_JSON(attempt);
+        MAINT_JSON(state); MAINT_JSON(reason); MAINT_JSON(evidence); MAINT_JSON(reset_claims);
+        MAINT_JSON(reset_returned); MAINT_JSON(reset_status); MAINT_JSON(boot_owned); MAINT_JSON(net_owned);
+        MAINT_JSON(bulk_owned); MAINT_JSON(producer_active); MAINT_JSON(provider_retained); MAINT_JSON(physical_reclaim_observed);
+#undef MAINT_JSON
+    } else { out << ",\"error\":"; appendWin32(out,result.operation,result.code); }
+    out << '}'; return emit(out.str(),valid?0:1);
+}
 int run(int argc, wchar_t** argv) {
+    if (argc>1 && (!std::wcscmp(argv[1],L"maintenance-query") || !std::wcscmp(argv[1],L"maintenance-prepare")))
+        return runMaintenance(argc,argv);
+    if (argc>1 && std::wcscmp(argv[1],L"perf-query")==0) return runPerfCommand(argc,argv);
     if (argc>1 && (std::wcscmp(argv[1],L"net-data-query")==0 || std::wcscmp(argv[1],L"net-tx")==0))
         return runNetDataCommand(argc,argv);
     if (argc > 1 && std::wcscmp(argv[1], L"runtime-info") == 0)
@@ -1445,6 +1693,8 @@ int run(int argc, wchar_t** argv) {
     if (argc>1 && (std::wcscmp(argv[1],L"boot-query")==0 ||
         std::wcscmp(argv[1],L"boot-load")==0 || std::wcscmp(argv[1],L"boot-submit")==0))
         return runBootCommand(argc,argv);
+    if (argc>1 && std::wcscmp(argv[1],L"hostwin-query")==0) return runHostwinCommand(argc,argv);
+    if (argc>1 && std::wcscmp(argv[1],L"hostwin-write")==0) return runHostwinWriteCommand(argc,argv);
     const char* resetCommand = nullptr;
     const char* hostReadyCommand = nullptr;
     const char* sysinfoCommand = nullptr;
@@ -1518,7 +1768,7 @@ int run(int argc, wchar_t** argv) {
             index = index * 10 + value;
         }
     } else {
-        return error("arguments", "Usage: nnpi-info [list] | nnpi-info runtime-info --index N | nnpi-info info --index N | nnpi-info diag --index N | nnpi-info status --index N | nnpi-info snapshot --index N | nnpi-info dmacheck --index N | nnpi-info resetcaps --index N | nnpi-info host-ready[-observe] --index N --generation G --epoch E | nnpi-info sysinfo-submit --index N --generation G --epoch E | nnpi-info sysinfo-query --index N (zero-based; required even for one device)", 2);
+        return error("arguments", "Usage: nnpi-info [list] | nnpi-info runtime-info --index N | nnpi-info info --index N | nnpi-info diag --index N | nnpi-info status --index N | nnpi-info snapshot --index N | nnpi-info dmacheck --index N | nnpi-info resetcaps --index N | nnpi-info host-ready[-observe] --index N --generation G --epoch E | nnpi-info sysinfo-submit --index N --generation G --epoch E | nnpi-info sysinfo-query --index N | nnpi-info hostwin-query --index N (zero-based; required even for one device)", 2);
     }
 
     const auto paths = enumerateInterfaces();

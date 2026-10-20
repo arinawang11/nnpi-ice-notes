@@ -9,4 +9,4 @@
 *.cmd text eol=crlf
 *.sln text eol=crlf
 *.vcxproj text eol=crlf
-*.inf text eol=crlf
+*.inf -text

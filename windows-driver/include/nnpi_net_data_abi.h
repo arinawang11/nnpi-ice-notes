@@ -6,7 +6,13 @@
 #define NNPI_NET_DATA_VERSION 1u
 #define NNPI_NET_DATA_QUERY_IOCTL 0x80006054u /* 0x815 BUFFERED READ */
 #define NNPI_NET_TX_IOCTL 0x8000e058u /* 0x816 BUFFERED READ|WRITE */
+/* Legacy public transfer limit, NOT internal CPU ring capacity. Claim queue_depth
+ * remains this transfer window. batch.remaining=min(actual queued,4), a bounded
+ * more-available hint. Layout/version remain unchanged. */
 #define NNPI_NET_RX_QUEUE_DEPTH 4u
+/* 0.2.0.1 diagnostics report true depth. Older validators limited it to four:
+ * use the matching new diagnostic tool when upgrading, not a saturated counter. */
+#define NNPI_NET_DATA_RX_QUEUED_MAX 32u
 /* Independent RX ABI; legacy diagnostic/TX layouts and version stay unchanged.
  * Exact sizes are required. All reserved fields and unused output bytes are zero.
  * A claim belongs to the file object, not PID or numeric user handle. It excludes
@@ -19,6 +25,9 @@
 #define NNPI_NET_RX_CLAIM_IOCTL 0x8000e05cu
 #define NNPI_NET_RX_RELEASE_IOCTL 0x8000e060u
 #define NNPI_NET_RX_BATCH_IOCTL 0x8000e064u
+/* Same buffers as BATCH; empty waits until data or cancellation/revocation.
+ * Unsupported drivers reject the new code; callers MUST NOT fall back. */
+#define NNPI_NET_RX_WAIT_IOCTL 0x8000e06cu /* 0x81b BUFFERED READ|WRITE */
 #define NNPI_NET_RX_FRAME_BYTES 4096u
 struct nnpi_net_rx_claim_request {
     uint32_t version, size;
@@ -82,7 +91,7 @@ static inline int nnpi_net_data_response_valid(const struct nnpi_net_data_respon
     return r && bytes==sizeof(*r) && r->version==NNPI_NET_DATA_VERSION && r->size==sizeof(*r) &&
         r->session_id!=UINT64_MAX && r->generation!=UINT64_MAX && r->epoch!=UINT64_MAX &&
         r->rx_ack_pending<=16 && r->tx_busy<=16 && r->tx_pending<=r->tx_busy &&
-        r->rx_queued<=NNPI_NET_RX_QUEUE_DEPTH && r->fault_retained<=1 && r->last_emit_halves<=2 &&
+        r->rx_queued<=NNPI_NET_DATA_RX_QUEUED_MAX && r->fault_retained<=1 && r->last_emit_halves<=2 &&
         !r->reserved[0] && !r->reserved[1] && !r->reserved[2] && !r->reserved[3];
 }
 #endif
