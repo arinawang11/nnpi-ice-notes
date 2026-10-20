@@ -22,7 +22,16 @@ PyTorch 倒是能正常用，而且速度不算差。
 - `image-builder/`：把用户提供的通用内核构建成卡端启动镜像。
 
 安装、安全、发布计划与卡端根因见 `windows-driver/README.md` 和
-`docs/release/`。1.0 剩下的门槛是 C2H 句柄生命周期修复的持续负载硬件验证。
+`docs/release/`。
+
+**硬件验证（2026-10-20）。** 用本地构建的镜像（vendor 5.7 内核 + 打补丁的
+`sphcs` + Alpine initramfs；验证用的是这份代码的测试构建 0.3.0.44）在卡上
+启动，通过 raw tunnel 连续读取 15 GiB NBD 数据：`rc=0`，盘尾
+`NNPISTRESS DONE` 标记写入成功，卡全程停在 phase 9，没有复位或重启，宿主
+没有 0x80 NMI、没有 WHEA、没有 0x9F（约 10.2 MB/s，约 24 分钟）。这越过了
+之前 7.3 GB 的必崩点。1.0 剩下的阻塞项是启动超时后的 teardown 路径：600 秒
+`WAIT_DRIVER` 超时后，当前的有界等待仍可能在卡还活跃时释放 DMA，已经因此
+出现过 0x80 NMI。启动未决时设备应保持 fault，不要释放 DMA。
 
 ## 硬件情况
 

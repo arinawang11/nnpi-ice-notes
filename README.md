@@ -26,8 +26,18 @@ The community driver is being prepared for its first supported release
 - `image-builder/` to turn a user-supplied kernel into a card boot image.
 
 See `windows-driver/README.md` and `docs/release/` for install, safety, the
-release plan and the card-side root-cause notes. The remaining 1.0 blocker is
-hardware validation of the C2H handle-lifecycle fixes under sustained load.
+release plan and the card-side root-cause notes.
+
+**Hardware validation (2026-10-20).** A locally built image (vendor 5.7 kernel,
+patched `sphcs`, Alpine initramfs; test build 0.3.0.44 of this code) booted on
+the card and served a 15 GiB sequential NBD read over the raw tunnel: `rc=0`,
+the `NNPISTRESS DONE` marker was written at the disk tail, the card stayed in
+phase 9 with no reset or reboot, and the host logged no 0x80 NMI, no WHEA and
+no 0x9F during the run (~10.2 MB/s, ~24 minutes). This passes the old 7.3 GB
+failure point. The remaining 1.0 blocker is the boot-timeout teardown path:
+after a 600 s `WAIT_DRIVER` timeout the bounded waits still let cleanup
+release DMA while the card may be active, which has produced 0x80 NMIs. On an
+unresolved boot the device must stay faulted instead of freeing DMA.
 
 ## The hardware
 
