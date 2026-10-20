@@ -8,7 +8,7 @@
  * replay, allocation, channel creation or SSH success claim. Qwords below are
  * host numeric values; the transport serializes little-endian bytes.
  *
- * Sources (paths relative to the original vendor driver tree):
+ * Sources (relative to /home/arina/nnpi):
  * diag1150-net/nnpi-tap.cpp - standalone TAP client, the authoritative wire
  *   layout via its static_assert/self-test (H2C 57/58, C2H 39/40, page slots,
  *   ACK recycling, card-fatal events);

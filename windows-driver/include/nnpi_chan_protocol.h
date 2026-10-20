@@ -8,7 +8,7 @@
  * MMIO, ACK replay, allocation or SSH success claim. Qwords are host numeric
  * values; the transport serializes little-endian bytes.
  *
- * Sources (paths relative to the original vendor driver tree):
+ * Sources (relative to /home/arina/nnpi):
  * nnpi-host/src/nnpi_drv/include/nnpi_ipc/ipc_protocol.h:229-259
  *   (union h2c_channel_op / h2c_channel_data_ringbuf_op), :361-371 (opcodes
  *   CHANNEL_OP=22, CHANNEL_RB_OP=23, CHANNEL_HOSTRES_OP=24);

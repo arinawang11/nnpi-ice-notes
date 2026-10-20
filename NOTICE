@@ -1,0 +1,30 @@
+﻿NNPI Community Driver
+Copyright (C) 2026 NNPI Community contributors
+
+This project is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 2 of the License, or (at your option) any later
+version. See LICENSE for the full text.
+
+Components and provenance
+-------------------------
+- Host kernel driver, diagnostics CLI and network bridge in windows-driver/:
+  original work of the NNPI Community contributors, licensed GPL-2.0-only
+  (SPDX headers in each file).
+- Card-side `sphcs` kernel module: Copyright (C) 2019-2021 Intel Corporation,
+  licensed GPL-2.0-or-later (SPDX headers in each file). It is redistributed
+  here under the terms of its license; this project is not an Intel product
+  and is not endorsed by Intel.
+- TAP-Windows6 (OpenVPN) is an external dependency, not bundled in this
+  repository. Its license is GPL-2.0 with an MIT option; see the upstream
+  project for the exact terms.
+- The Microsoft Visual C++ runtime, when shipped app-local with prebuilt
+  tools, remains a proprietary Microsoft component and is not relicensed
+  under the GPL. Windows SDK/WDK components are not redistributed here.
+
+Trademarks
+----------
+Intel, NNP-I and Spring Hill are trademarks of Intel Corporation. All other
+trademarks are the property of their respective owners. This project is an
+independent interoperability effort and is not affiliated with, sponsored by,
+or endorsed by Intel Corporation.

@@ -1,9 +1,24 @@
-# NNP-I Windows Host Driver (KMDF)
+﻿# NNP-I Windows Host Driver (KMDF)
 
 Windows 11 x64 KMDF driver and CLI for the Intel NNP-I 1150 host interface
 (`PCI\VEN_8086&DEV_45C6`). This is an independent interoperability
 implementation, not a vendor driver.
 
+## Release status
+
+Development build **0.3.0.34** (version header `include/nnpi_version.h`).
+Target release: **NNPI Community Driver 1.0.0**, supporting Windows Server 2025
+(build 26100) and Windows 11 24H2, x64.
+
+- Device class: project-defined **Coprocessor** class
+  (`{AD579C1F-5595-4EFA-B661-F64EAE1CDA5D}`), not a Microsoft NPU/DirectML class.
+- Power-transition fix: bounded `NnpiBootBarrier` / `NnpiNetBarrier` waits avoid
+  the 0x9F `DRIVER_POWER_STATE_FAILURE` hang on an unresponsive card.
+- Packaging is test-signed; see `../docs/release/INSTALL.md` and
+  `../docs/release/SAFETY.md`.
+- Known pre-1.0 limitation: sustained high-throughput NBD traffic can
+  destabilize the card module; the C2H handle lifecycle fix is the remaining
+  release blocker.
 ## Scope
 
 The driver exposes a private device interface for:

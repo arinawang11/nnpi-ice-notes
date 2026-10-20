@@ -15,7 +15,7 @@
     <DriverType>KMDF</DriverType>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
     <TargetVersion>Windows10</TargetVersion>
-    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
     <KmdfVersion>$(NnpiKmdfVersion)</KmdfVersion>
     <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
     <DriverSignMode>Off</DriverSignMode>
@@ -27,6 +27,8 @@
     <OutDir>$(ProjectDir)..\build\$(Platform)\$(Configuration)\driver\</OutDir>
     <IntDir>$(ProjectDir)..\build\obj\$(Platform)\$(Configuration)\driver\</IntDir>
     <TargetName>nnpi_info</TargetName>
+    <NnpiVersionHeader>$([System.IO.File]::ReadAllText('$(ProjectDir)..\include\nnpi_version.h'))</NnpiVersionHeader>
+    <NnpiDriverVersion>$([System.Text.RegularExpressions.Regex]::Match('$(NnpiVersionHeader)', '#define NNPI_DRIVER_VERSION &quot;([0-9.]+)&quot;').Groups[1].Value)</NnpiDriverVersion>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
@@ -39,13 +41,14 @@
     <Link><AdditionalDependencies>Cng.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
     <Inf>
       <SpecifyDriverVerDirectiveDate>true</SpecifyDriverVerDirectiveDate>
-      <DateStamp>09/20/2026</DateStamp>
+      <DateStamp>10/20/2026</DateStamp>
       <SpecifyDriverVerDirectiveVersion>true</SpecifyDriverVerDirectiveVersion>
-      <TimeStamp>15.4.45.213</TimeStamp>
+      <TimeStamp>$(NnpiDriverVersion)</TimeStamp>
     </Inf>
   </ItemDefinitionGroup>
-  <ItemGroup><ClCompile Include="driver.c" /><ClCompile Include="nnpi_hw.c" /><ClCompile Include="nnpi_dma.c" /><ClCompile Include="nnpi_reset.c" /><ClCompile Include="nnpi_image.c" /><ClCompile Include="nnpi_net_dma.c" /><ClCompile Include="nnpi_irq.c" /></ItemGroup>
+  <ItemGroup><ClCompile Include="driver.c" /><ClCompile Include="nnpi_hw.c" /><ClCompile Include="nnpi_dma.c" /><ClCompile Include="nnpi_reset.c" /><ClCompile Include="nnpi_image.c" /><ClCompile Include="nnpi_net_dma.c" /><ClCompile Include="nnpi_bulk_dma.c" /><ClCompile Include="nnpi_irq.c" /></ItemGroup>
   <ItemGroup><ClInclude Include="nnpi_image.h" /><ClInclude Include="..\include\nnpi_boot_abi.h" /><ClInclude Include="..\include\nnpi_boot_session.h" /><ClInclude Include="..\include\nnpi_runtime_protocol.h" /></ItemGroup>
+  <ItemGroup><ResourceCompile Include="nnpi_info.rc" /></ItemGroup>
   <ItemGroup><Inf Include="nnpi_info.inf" /></ItemGroup>
   <ItemGroup><ClInclude Include="..\include\nnpi_info_abi.h" /><ClInclude Include="..\include\nnpi_interface.h" /></ItemGroup>
   <ItemGroup><ClInclude Include="nnpi_hw.h" /><ClInclude Include="..\include\nnpi_diag_abi.h" /><ClInclude Include="..\include\nnpi_bar_match.h" /></ItemGroup>
@@ -62,7 +65,11 @@
   <ItemGroup><ClInclude Include="..\include\nnpi_runtime_info_abi.h" /><ClInclude Include="..\include\nnpi_runtime_dispatch.h" /></ItemGroup>
   <ItemGroup><ClInclude Include="..\include\nnpi_net_control.h" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="ValidateDriverVersions" AfterTargets="Build">
+    <Exec Command="python &quot;$(ProjectDir)..\tools\check-version.py&quot; --project --inf &quot;$(OutDir)nnpi_info.inf&quot; --sys &quot;$(OutDir)nnpi_info.sys&quot; --expected &quot;$(NnpiDriverVersion)&quot;" />
+  </Target>
   <Target Name="ValidateExplicitKit" BeforeTargets="PrepareForBuild">
+    <Exec Command="python &quot;$(ProjectDir)..\tools\check-version.py&quot; --project" />
     <Error Condition="'$(Platform)'!='x64'" Text="Only Windows 11 x64 is in scope." />
     <Error Condition="'$(NnpiWdkVersion)'==''" Text="Specify /p:NnpiWdkVersion from inventory; no implicit latest kit." />
     <Error Condition="'$(NnpiKmdfVersion)'==''" Text="Specify /p:NnpiKmdfVersion from the installed WDK." />

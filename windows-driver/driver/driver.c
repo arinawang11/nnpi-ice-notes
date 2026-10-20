@@ -13,9 +13,13 @@
 #include <devpkey.h>
 #include <bcrypt.h>
 #include "nnpi_image.h"
+#include "../include/nnpi_maintenance.h"
+C_ASSERT(NNPI_MAINTENANCE_PREPARE_IOCTL == CTL_CODE(0x8000u,0x81e,METHOD_BUFFERED,FILE_READ_ACCESS|FILE_WRITE_ACCESS));
+C_ASSERT(NNPI_MAINTENANCE_QUERY_IOCTL == CTL_CODE(0x8000u,0x81f,METHOD_BUFFERED,FILE_READ_ACCESS));
 #include "../include/nnpi_boot_abi.h"
 #include "../include/nnpi_boot_session.h"
 #include "../include/nnpi_runtime_protocol.h"
+#include "../include/nnpi_runtime_time.h"
 #include "../include/nnpi_runtime_dispatch.h"
 #include "../include/nnpi_runtime_info_abi.h"
 #include "../include/nnpi_info_abi.h"
@@ -32,6 +36,11 @@
 #include "../include/nnpi_pnp_policy.h"
 #include "../include/nnpi_net_control.h"
 #include "../include/nnpi_net_data.h"
+#include "../include/nnpi_perf_abi.h"
+#include "../include/nnpi_hostwin_abi.h"
+C_ASSERT(NNPI_PERF_QUERY_IOCTL == CTL_CODE(NNPI_INFO_DEVICE_TYPE,0x81a,METHOD_BUFFERED,FILE_READ_ACCESS));
+C_ASSERT(NNPI_HOSTWIN_QUERY_IOCTL == CTL_CODE(NNPI_INFO_DEVICE_TYPE,0x820,METHOD_BUFFERED,FILE_READ_ACCESS));
+C_ASSERT(NNPI_HOSTWIN_WRITE_IOCTL == CTL_CODE(NNPI_INFO_DEVICE_TYPE,0x821,METHOD_BUFFERED,FILE_WRITE_ACCESS));
 C_ASSERT(NNPI_NET_DATA_QUERY_IOCTL == CTL_CODE(NNPI_INFO_DEVICE_TYPE,0x815,METHOD_BUFFERED,FILE_READ_ACCESS));
 C_ASSERT(NNPI_NET_TX_IOCTL == CTL_CODE(NNPI_INFO_DEVICE_TYPE,0x816,METHOD_BUFFERED,FILE_READ_ACCESS|FILE_WRITE_ACCESS));
 C_ASSERT(NNPI_NET_RX_CLAIM_IOCTL == CTL_CODE(NNPI_INFO_DEVICE_TYPE,0x817,METHOD_BUFFERED,FILE_READ_ACCESS|FILE_WRITE_ACCESS));
@@ -99,7 +108,15 @@ typedef struct _NNPI_BOOT_DIAGNOSTIC {
     ULONG ResetEntered, ResetReturned, ResetStatus;
 } NNPI_BOOT_DIAGNOSTIC;
 
+#include "nnpi_bulk_dma.h"
+#include "../include/nnpi_bulk_abi.h"
+C_ASSERT(NNPI_BULK_BEGIN_IOCTL == CTL_CODE(NNPI_INFO_DEVICE_TYPE,0x81c,METHOD_BUFFERED,FILE_READ_ACCESS|FILE_WRITE_ACCESS));
+C_ASSERT(NNPI_BULK_QUERY_IOCTL == CTL_CODE(NNPI_INFO_DEVICE_TYPE,0x81d,METHOD_BUFFERED,FILE_READ_ACCESS));
 typedef struct _NNPI_DEVICE_CONTEXT {
+    struct nnpi_maintenance_response Maintenance;
+    ULONGLONG MaintenanceDeadline;
+    struct nnpi_bulk_state Bulk;
+    NNPI_BULK_DMA BulkDma;
     WDFDEVICE Device;
     WDFWAITLOCK CacheLock;
     struct nnpi_info_response Cache;
@@ -114,7 +131,8 @@ typedef struct _NNPI_DEVICE_CONTEXT {
     struct nnpi_resetcaps_response ResetCaps;
     DEVICE_RESET_INTERFACE_STANDARD ResetInterface;
     ULONGLONG DeviceId, Epoch;
-    WDFQUEUE ResetQueue, LegacyQueue;
+    WDFQUEUE ResetQueue, LegacyQueue, RxWaitQueue;
+    WDFWORKITEM RxWaitWork;
     BOOLEAN ResetBlocked;
     BOOLEAN Removed;
     NNPI_COMMAND_MAPPING SysinfoMapping;
@@ -126,10 +144,17 @@ typedef struct _NNPI_DEVICE_CONTEXT {
     struct nnpi_boot_response Boot;
     struct nnpi_boot_session BootSession;
     PIO_WORKITEM BootWork;
-    KEVENT BootDone, BootClose;
+    /* Auto-reset work hint lives as long as the device; never manually cleared.
+     * Boot session is single-use; stale hints are harmless gated empty rounds. */
+    KEVENT BootDone, BootClose, RuntimeWork;
+    struct nnpi_perf_response Perf;
+    uint64_t TxQueuedQpc[NNPI_ETH_SLOTS];
+    ULONG PumpSent;
+    BOOLEAN PumpFull;
     BOOLEAN BootClosing, BootStarted;
     DEVICE_RESET_INTERFACE_STANDARD BootResetInterface;
     NNPI_SNAPSHOT_MAPPING RuntimeMapping;
+    NNPI_HOSTWIN_MAPPING HostwinMapping;
     struct nnpi_runtime_parser RuntimeParser;
     struct nnpi_runtime_message RuntimeVersion, RuntimeLastMessage;
     uint64_t RuntimeWords[16];
@@ -168,12 +193,20 @@ EVT_WDF_DEVICE_D0_EXIT NnpiD0Exit;
 EVT_WDF_DEVICE_SURPRISE_REMOVAL NnpiSurpriseRemoval;
 EVT_WDF_DEVICE_FILE_CREATE NnpiFileCreate;
 EVT_WDF_FILE_CLEANUP NnpiFileCleanup;
+EVT_WDF_WORKITEM NnpiRxWaitWork;
+EVT_WDF_IO_QUEUE_IO_CANCELED_ON_QUEUE NnpiRxWaitCanceled;
+static WDFREQUEST NnpiRxRevokeLocked(PNNPI_DEVICE_CONTEXT c);
+static VOID NnpiRxWake(PNNPI_DEVICE_CONTEXT c);
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL NnpiIoDeviceControl;
 EVT_WDF_IO_QUEUE_IO_STOP NnpiIoStop;
 EVT_WDF_DRIVER_UNLOAD NnpiDriverUnload;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL NnpiRouteRequest;
 static volatile LONG64 NnpiDeviceSequence;
 
+static VOID NnpiBulkBarrier(PNNPI_DEVICE_CONTEXT Context);
+static VOID NnpiBulkRequest(PNNPI_DEVICE_CONTEXT c,WDFREQUEST Request,
+    size_t OutputBytes,size_t InputBytes,ULONG Code);
+static VOID NnpiMaintenanceFinish(PNNPI_DEVICE_CONTEXT c);
 static VOID NnpiBootBarrier(PNNPI_DEVICE_CONTEXT Context);
 static VOID NnpiBootWorker(PDEVICE_OBJECT DeviceObject,PVOID Parameter);
 static VOID NnpiBootRuntime(PNNPI_DEVICE_CONTEXT Context);
@@ -190,14 +223,15 @@ static ULONG NnpiNetGate(PNNPI_DEVICE_CONTEXT c,uint64_t generation,uint64_t epo
     ULONG channel,ULONG ip,const uint8_t mac[6],BOOLEAN continuing);
 static VOID NnpiSysinfoWorker(PDEVICE_OBJECT DeviceObject,PVOID Parameter);
 static VOID NnpiSysinfoRefresh(PNNPI_DEVICE_CONTEXT Context);
+static VOID NnpiHostwinRequest(PNNPI_DEVICE_CONTEXT Context,WDFREQUEST Request,
+    size_t OutputBytes,size_t InputBytes);
 EVT_WDF_DEVICE_QUERY_STOP NnpiQueryStop;
 EVT_WDF_DEVICE_QUERY_REMOVE NnpiQueryRemove;
-static NTSTATUS NnpiSysinfoQueryPnp(WDFDEVICE Device)
+/* CacheLock held; shared by PnP and maintenance proof, no side effects. */
+static ULONG NnpiPnpReasons(PNNPI_DEVICE_CONTEXT context)
 {
-    PNNPI_DEVICE_CONTEXT context=NnpiGetContext(Device);
     struct nnpi_pnp_snapshot snapshot;
     ULONG reasons;
-    WdfWaitLockAcquire(context->CacheLock,NULL);
     /* Read-only snapshot: queued/tail workers and actual DMA ownership must
      * agree with session release evidence before any close notification. */
     snapshot.boot_started=context->BootStarted;
@@ -222,6 +256,17 @@ static NTSTATUS NnpiSysinfoQueryPnp(WDFDEVICE Device)
     snapshot.netdma_published=context->NetDma.Published;
     snapshot.netdma_stop_confirmed=context->NetDma.StopConfirmed;
     reasons=nnpi_pnp_query_veto_reasons(&snapshot);
+    if (!nnpi_bulk_may_release(&context->Bulk)) reasons|=0x80000000u;
+    return reasons;
+}
+static NTSTATUS NnpiSysinfoQueryPnp(WDFDEVICE Device)
+{
+    PNNPI_DEVICE_CONTEXT context=NnpiGetContext(Device);
+    ULONG reasons;
+    WdfWaitLockAcquire(context->CacheLock,NULL);
+    reasons=NnpiPnpReasons(context);
+    if (nnpi_maintenance_closed(&context->Maintenance) &&
+        context->Maintenance.state!=NNPI_MAINT_QUIESCED) reasons|=0x40000000u;
     if (reasons) {
         context->PnPQueryVetoReasons=reasons;
         if (context->PnPQueryVetoCount!=MAXULONG) ++context->PnPQueryVetoCount;
@@ -233,7 +278,7 @@ static NTSTATUS NnpiSysinfoQueryPnp(WDFDEVICE Device)
     context->RuntimeHealthy=FALSE; context->BootClosing=TRUE; context->Boot.closing=1;
     KeSetEvent(&context->BootClose,IO_NO_INCREMENT,FALSE);
     context->SysinfoClosing=TRUE;
-    context->NetClosing=TRUE; context->Net.closing=1;
+    context->NetClosing=TRUE; context->Net.closing=1; NnpiRxWake(context);
     KeSetEvent(&context->NetClose,IO_NO_INCREMENT,FALSE);
     WdfWaitLockRelease(context->CacheLock);
     return STATUS_SUCCESS;
@@ -418,6 +463,7 @@ NnpiInvalidate(_In_ PNNPI_DEVICE_CONTEXT Context, _In_ BOOLEAN Removed)
     NnpiBootBarrier(Context);
     NnpiSysinfoBarrier(Context);
     NnpiNetBarrier(Context);
+    NnpiBulkBarrier(Context);
     WdfWaitLockAcquire(Context->CacheLock, NULL);
     Context->Removed = (BOOLEAN)(Context->Removed || Removed);
     if (Context->Epoch != UINT64_MAX) ++Context->Epoch;
@@ -433,8 +479,10 @@ NnpiInvalidate(_In_ PNNPI_DEVICE_CONTEXT Context, _In_ BOOLEAN Removed)
     (void)NnpiImageRelease(&Context->Image);
     NnpiDmaRelease(&Context->Dma);
     (void)NnpiNetDmaRelease(&Context->NetDma);
+    (void)NnpiBulkDmaRelease(&Context->BulkDma,&Context->Bulk);
     Context->Sysinfo.page_retained=0;
     NnpiUnmapSysinfo(&Context->SysinfoMapping);
+    NnpiUnmapHostwin(&Context->HostwinMapping);
     RtlZeroMemory(&Context->ResetCaps, sizeof(Context->ResetCaps));
     NnpiUnmapControlSnapshot(&Context->SnapshotMapping);
     NnpiUnmapStatus0(&Context->StatusMapping);
@@ -536,6 +584,14 @@ NnpiDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     context->Boot.image_bytes=NNPI_BOOT_IMAGE_BYTES;
     KeInitializeEvent(&context->BootDone,NotificationEvent,TRUE);
     KeInitializeEvent(&context->BootClose,NotificationEvent,FALSE);
+    KeInitializeEvent(&context->RuntimeWork,SynchronizationEvent,FALSE);
+    {
+        LARGE_INTEGER frequency;
+        (void)KeQueryPerformanceCounter(&frequency);
+        context->Perf.version=NNPI_PERF_VERSION;
+        context->Perf.size=sizeof(context->Perf);
+        context->Perf.qpc_frequency=(uint64_t)frequency.QuadPart;
+    }
     context->Net.version=NNPI_NET_ABI_VERSION;
     context->Net.size=sizeof(context->Net);
     KeInitializeEvent(&context->NetDone,NotificationEvent,TRUE);
@@ -574,6 +630,25 @@ NnpiDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     queueConfig.EvtIoDeviceControl = NnpiIoDeviceControl;
     status = WdfIoQueueCreate(device, &queueConfig, &attributes, &context->ResetQueue);
     if (!NT_SUCCESS(status)) return status;
+    /* Non-power-managed: CPU-only waits must not hold a D0 transition open.
+     * Framework owns queued cancellation; no driver-held raw request pointer. */
+    WDF_IO_QUEUE_CONFIG_INIT(&queueConfig, WdfIoQueueDispatchManual);
+    queueConfig.PowerManaged = WdfFalse;
+    queueConfig.EvtIoCanceledOnQueue = NnpiRxWaitCanceled;
+    status = WdfIoQueueCreate(device, &queueConfig, &attributes, &context->RxWaitQueue);
+    if (!NT_SUCCESS(status)) return status;
+    {
+        WDF_WORKITEM_CONFIG workConfig;
+        WDF_WORKITEM_CONFIG_INIT(&workConfig, NnpiRxWaitWork);
+        workConfig.AutomaticSerialization = FALSE;
+        WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+        attributes.ParentObject = device;
+        status = WdfWorkItemCreate(&workConfig, &attributes, &context->RxWaitWork);
+        if (!NT_SUCCESS(status)) return status;
+    }
+    WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+    attributes.ExecutionLevel = WdfExecutionLevelPassive;
+    attributes.SynchronizationScope = WdfSynchronizationScopeNone;
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchParallel);
     queueConfig.PowerManaged = WdfFalse;
     queueConfig.EvtIoDeviceControl = NnpiRouteRequest;
@@ -597,17 +672,38 @@ NnpiFileCreate(WDFDEVICE Device, WDFREQUEST Request, WDFFILEOBJECT FileObject)
         name != NULL && name->Length == 0 ? STATUS_SUCCESS : STATUS_OBJECT_NAME_INVALID, 0);
 }
 
+/* Retrieve transfers exclusive completion ownership from WDF. Cancellation
+ * either wins in the manual queue or loses to retrieve; never mark cancelable. */
+static WDFREQUEST NnpiRxRevokeLocked(PNNPI_DEVICE_CONTEXT c)
+{
+    WDFREQUEST request=NULL;
+    if (c->RxWaitQueue) (void)WdfIoQueueRetrieveNextRequest(c->RxWaitQueue,&request);
+    return request;
+}
+VOID NnpiRxWaitCanceled(WDFQUEUE Queue,WDFREQUEST Request)
+{
+    UNREFERENCED_PARAMETER(Queue);
+    WdfRequestCompleteWithInformation(Request,STATUS_CANCELLED,0);
+}
+static VOID NnpiRxWake(PNNPI_DEVICE_CONTEXT c)
+{
+    if (c->RxWaitWork) WdfWorkItemEnqueue(c->RxWaitWork);
+}
+
 /* File cleanup is deliberately CPU-only. A dispatched request racing cleanup
  * must see Cleaned under the same lock and cannot resurrect the claim. */
 static VOID NnpiNetConsumerCleanup(PNNPI_DEVICE_CONTEXT c,WDFFILEOBJECT file)
 {
+    WDFREQUEST revoked=NULL;
     WdfWaitLockAcquire(c->CacheLock,NULL);
     NnpiGetFileContext(file)->Cleaned=TRUE;
     if (c->NetConsumer==file) {
+        revoked=NnpiRxRevokeLocked(c);
         c->NetConsumer=NULL;
         RtlZeroMemory(&c->NetConsumerKey,sizeof(c->NetConsumerKey));
     }
     WdfWaitLockRelease(c->CacheLock);
+    if (revoked) WdfRequestCompleteWithInformation(revoked,STATUS_CANCELLED,0);
 }
 _Use_decl_annotations_
 VOID NnpiFileCleanup(WDFFILEOBJECT FileObject)
@@ -755,6 +851,7 @@ NnpiPrepareHardware(WDFDEVICE Device, WDFCMRESLIST ResourcesRaw,
         NnpiMapHostReady(&diagnostic,&context->HostReadyMapping);
         NnpiMapRuntime(&diagnostic,&context->RuntimeMapping);
         NnpiMapSysinfo(&diagnostic,&context->SysinfoMapping);
+        NnpiMapHostwin(&diagnostic,&context->HostwinMapping);
         (void)NnpiIrqMap(&diagnostic,&context->IrqMapping);
         NnpiLogStage(34, STATUS_SUCCESS, context->SnapshotMapping.Reason);
         NnpiDmaPrepare(&context->Dma, snapshot.generation);
@@ -794,7 +891,7 @@ NnpiSurpriseRemoval(WDFDEVICE Device)
     /* Concurrent with D0Exit/Release. Never delete/unmap/wait here. */
     WdfWaitLockAcquire(context->CacheLock,NULL);
     context->Removed=TRUE; context->SysinfoClosing=TRUE;
-    context->NetClosing=TRUE; context->Net.closing=1;
+    context->NetClosing=TRUE; context->Net.closing=1; NnpiRxWake(context);
     KeSetEvent(&context->NetClose,IO_NO_INCREMENT,FALSE);
     NnpiIrqInvalidate(&context->IrqMapping);
     context->RuntimeHealthy=FALSE; context->BootClosing=TRUE; context->Boot.closing=1;
@@ -840,6 +937,7 @@ NnpiD0Exit(WDFDEVICE Device, WDF_POWER_DEVICE_STATE TargetState)
      * reserved cleanup while D0 is still current. Surprise closes MMIO itself. */
     NnpiBootBarrier(context);
     NnpiNetBarrier(context);
+    NnpiBulkBarrier(context);
     NnpiSysinfoBarrier(context);
     WdfWaitLockAcquire(context->CacheLock, NULL);
     nnpi_sysinfo_invalidate(&context->Sysinfo);
@@ -892,7 +990,7 @@ static BOOLEAN NnpiResetHardwareBlocked(PNNPI_DEVICE_CONTEXT Context)
 {
     struct nnpi_reset_response state;
     NnpiResetQuery(Context->DeviceId, Context->Cache.generation, Context->Epoch, &state);
-    return Context->Boot.load_state!=NNPI_BOOT_LOAD_EMPTY || Context->BootClosing || Context->SysinfoStarted || Context->SysinfoClosing || Context->ResetBlocked || state.hardware_blocked;
+    return nnpi_maintenance_closed(&Context->Maintenance) || Context->Boot.load_state!=NNPI_BOOT_LOAD_EMPTY || Context->BootClosing || Context->SysinfoStarted || Context->SysinfoClosing || Context->ResetBlocked || state.hardware_blocked;
 }
 
 /* Validate BOTH buffers before any hardware operation. METHOD_BUFFERED input
@@ -1049,6 +1147,95 @@ VOID NnpiDriverUnload(WDFDRIVER Driver)
     NnpiResetUnload();
 }
 
+/* Cache-only, exact-sized copy of the card's host window. No address or offset
+ * is user-selectable; the window base is fixed at BAR2+offset and mapped once. */
+_IRQL_requires_(PASSIVE_LEVEL)
+static VOID NnpiHostwinRequest(PNNPI_DEVICE_CONTEXT Context, WDFREQUEST Request,
+                               size_t OutputBytes, size_t InputBytes)
+{
+    struct nnpi_hostwin_request input;
+    struct nnpi_hostwin_response response;
+    PVOID buffer;
+    NTSTATUS status;
+    uint32_t gate;
+    ULONG_PTR information = 0;
+    if (InputBytes != sizeof(input)) { status = STATUS_INFO_LENGTH_MISMATCH; goto Complete; }
+    status = WdfRequestRetrieveInputBuffer(Request, sizeof(input), &buffer, NULL);
+    if (!NT_SUCCESS(status)) goto Complete;
+    RtlCopyMemory(&input, buffer, sizeof(input));
+    if (!nnpi_hostwin_request_valid(&input, InputBytes)) { status = STATUS_INVALID_PARAMETER; goto Complete; }
+    if (OutputBytes != sizeof(response)) { status = STATUS_INFO_LENGTH_MISMATCH; goto Complete; }
+    status = WdfRequestRetrieveOutputBuffer(Request, sizeof(response), &buffer, NULL);
+    if (!NT_SUCCESS(status)) goto Complete;
+    WdfWaitLockAcquire(Context->CacheLock, NULL);
+    gate = nnpi_hostwin_gate(Context->Cache.flags, Context->Removed,
+        Context->HostwinMapping.Address != NULL, Context->Cache.generation,
+        Context->HostwinMapping.Reason);
+    RtlZeroMemory(&response, sizeof(response));
+    response.reason = gate;
+    if (gate == NNPI_HOSTWIN_OK) {
+        status = NnpiReadHostwin(&Context->HostwinMapping, &response);
+        if (!NT_SUCCESS(status)) { response.reason = NNPI_HOSTWIN_MAP_FAILED; }
+        else { response.reason = NNPI_HOSTWIN_OK; }
+    } else {
+        status = gate == NNPI_HOSTWIN_REMOVED ? STATUS_DEVICE_REMOVED : STATUS_DEVICE_NOT_READY;
+    }
+    /* NnpiReadHostwin zeroes the struct, so stamp metadata after the read. */
+    response.version = NNPI_HOSTWIN_VERSION;
+    response.size = (uint32_t)sizeof(response);
+    response.generation = Context->Cache.generation;
+    WdfWaitLockRelease(Context->CacheLock);
+    RtlCopyMemory(buffer, &response, sizeof(response));
+    information = sizeof(response);
+Complete:
+    WdfRequestCompleteWithInformation(Request, status, information);
+}
+
+/* Host->card write side of the shared window: accepts the CPU-Z report text and
+ * stamps it into the BAR2 window with the H2C magic for the card to read. The
+ * fixed window base and gate are reused from the read side; no address/offset is
+ * user-selectable. */
+_IRQL_requires_(PASSIVE_LEVEL)
+static VOID NnpiHostwinWriteRequest(PNNPI_DEVICE_CONTEXT Context, WDFREQUEST Request,
+                                    size_t OutputBytes, size_t InputBytes)
+{
+    struct nnpi_hostwin_write_request input;
+    struct nnpi_hostwin_write_response response;
+    PVOID buffer;
+    NTSTATUS status;
+    uint32_t gate, written = 0;
+    ULONG_PTR information = 0;
+    if (InputBytes != sizeof(input)) { status = STATUS_INFO_LENGTH_MISMATCH; goto Complete; }
+    status = WdfRequestRetrieveInputBuffer(Request, sizeof(input), &buffer, NULL);
+    if (!NT_SUCCESS(status)) goto Complete;
+    RtlCopyMemory(&input, buffer, sizeof(input));
+    if (!nnpi_hostwin_write_request_valid(&input, InputBytes)) { status = STATUS_INVALID_PARAMETER; goto Complete; }
+    if (OutputBytes != sizeof(response)) { status = STATUS_INFO_LENGTH_MISMATCH; goto Complete; }
+    status = WdfRequestRetrieveOutputBuffer(Request, sizeof(response), &buffer, NULL);
+    if (!NT_SUCCESS(status)) goto Complete;
+    WdfWaitLockAcquire(Context->CacheLock, NULL);
+    gate = nnpi_hostwin_gate(Context->Cache.flags, Context->Removed,
+        Context->HostwinMapping.Address != NULL, Context->Cache.generation,
+        Context->HostwinMapping.Reason);
+    RtlZeroMemory(&response, sizeof(response));
+    response.reason = gate;
+    if (gate == NNPI_HOSTWIN_OK) {
+        status = NnpiWriteHostwin(&Context->HostwinMapping, &input, &written);
+        if (!NT_SUCCESS(status)) { response.reason = NNPI_HOSTWIN_MAP_FAILED; }
+        else { response.reason = NNPI_HOSTWIN_OK; response.written_bytes = written; }
+    } else {
+        status = gate == NNPI_HOSTWIN_REMOVED ? STATUS_DEVICE_REMOVED : STATUS_DEVICE_NOT_READY;
+    }
+    response.version = NNPI_HOSTWIN_VERSION;
+    response.size = (uint32_t)sizeof(response);
+    response.generation = Context->Cache.generation;
+    WdfWaitLockRelease(Context->CacheLock);
+    RtlCopyMemory(buffer, &response, sizeof(response));
+    information = sizeof(response);
+Complete:
+    WdfRequestCompleteWithInformation(Request, status, information);
+}
+
 /* Nonpower router owns only forwarding; old IOCTLs still execute in their
  * original sequential power-managed queue with unchanged lifecycle gates. */
 _Use_decl_annotations_
@@ -1060,16 +1247,19 @@ VOID NnpiRouteRequest(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputBytes,
     UNREFERENCED_PARAMETER(OutputBytes);
     UNREFERENCED_PARAMETER(InputBytes);
     status=WdfRequestForwardToIoQueue(Request,
-        (Code==NNPI_RESET_SUBMIT_IOCTL || Code==NNPI_RESET_QUERY_IOCTL ||
+        (Code==NNPI_MAINTENANCE_PREPARE_IOCTL || Code==NNPI_MAINTENANCE_QUERY_IOCTL ||
+         Code==NNPI_BULK_BEGIN_IOCTL || Code==NNPI_BULK_QUERY_IOCTL ||
+         Code==NNPI_RESET_SUBMIT_IOCTL || Code==NNPI_RESET_QUERY_IOCTL ||
          Code==NNPI_RESET_REVALIDATE_IOCTL || Code==NNPI_HOSTREADY_SUBMIT_IOCTL ||
          Code==NNPI_HOSTREADY_OBSERVE_IOCTL || Code==NNPI_SYSINFO_SUBMIT_IOCTL ||
-         Code==NNPI_SYSINFO_QUERY_IOCTL || Code==NNPI_BOOT_BEGIN_IOCTL ||
+         Code==NNPI_SYSINFO_QUERY_IOCTL || Code==NNPI_HOSTWIN_QUERY_IOCTL || Code==NNPI_HOSTWIN_WRITE_IOCTL ||
+         Code==NNPI_BOOT_BEGIN_IOCTL ||
          Code==NNPI_BOOT_CHUNK_IOCTL || Code==NNPI_BOOT_SEAL_IOCTL ||
          Code==NNPI_BOOT_SUBMIT_IOCTL || Code==NNPI_BOOT_QUERY_IOCTL ||
          Code==NNPI_NET_BEGIN_IOCTL || Code==NNPI_NET_QUERY_IOCTL ||
-         Code==NNPI_RUNTIME_INFO_IOCTL || Code==NNPI_NET_DATA_QUERY_IOCTL ||
+         Code==NNPI_PERF_QUERY_IOCTL || Code==NNPI_RUNTIME_INFO_IOCTL || Code==NNPI_NET_DATA_QUERY_IOCTL ||
          Code==NNPI_NET_TX_IOCTL || Code==NNPI_NET_RX_CLAIM_IOCTL ||
-         Code==NNPI_NET_RX_RELEASE_IOCTL || Code==NNPI_NET_RX_BATCH_IOCTL) ? context->ResetQueue : context->LegacyQueue);
+         Code==NNPI_NET_RX_RELEASE_IOCTL || Code==NNPI_NET_RX_BATCH_IOCTL || Code==NNPI_NET_RX_WAIT_IOCTL) ? context->ResetQueue : context->LegacyQueue);
     if (!NT_SUCCESS(status)) WdfRequestComplete(Request,status);
 }
 
@@ -1437,6 +1627,95 @@ End:
     WdfRequestCompleteWithInformation(Request,status,information);
 }
 
+/* CPU-only finalization, under CacheLock, after the last hardware producer.
+ * BootDone proves no further context/hardware use, NOT callback return. The
+ * existing I/O work-item image/device reference and rundown tail remain intact. */
+static VOID NnpiMaintenanceFinish(PNNPI_DEVICE_CONTEXT c)
+{
+    struct nnpi_maintenance_response *m=&c->Maintenance;
+    if (!nnpi_maintenance_closed(m) || m->state==NNPI_MAINT_QUIESCED) return;
+    m->boot_owned=(c->Image.Enabler!=NULL || c->Dma.VirtualAddress!=NULL);
+    m->net_owned=c->NetDma.Enabler!=NULL;
+    m->bulk_owned=c->BulkDma.Enabler!=NULL;
+    m->producer_active=c->Boot.worker_active || c->Net.worker_active ||
+        (c->SysinfoStarted && !KeReadStateEvent(&c->SysinfoWorkerDone));
+    m->provider_retained=c->BootResetInterface.InterfaceDereference!=NULL;
+    if (m->reason || c->Removed || m->generation!=c->Cache.generation || m->epoch!=c->Epoch ||
+        NnpiPnpReasons(c) || m->provider_retained ||
+        (m->session && (m->reset_claims!=1 || !m->reset_returned || m->reset_status))) {
+        m->state=NNPI_MAINT_RETAINED; if (!m->reason) m->reason=1; return;
+    }
+    if (!NT_SUCCESS(NnpiImageRelease(&c->Image)) ||
+        !NT_SUCCESS(NnpiNetDmaRelease(&c->NetDma)) ||
+        !NT_SUCCESS(NnpiBulkDmaRelease(&c->BulkDma,&c->Bulk))) {
+        m->state=NNPI_MAINT_RETAINED; m->reason=2; return;
+    }
+    NnpiDmaRelease(&c->Dma);
+    m->boot_owned=(c->Image.Enabler!=NULL || c->Dma.VirtualAddress!=NULL);
+    m->net_owned=c->NetDma.Enabler!=NULL; m->bulk_owned=c->BulkDma.Enabler!=NULL;
+    if (m->boot_owned || m->net_owned || m->bulk_owned) {
+        m->state=NNPI_MAINT_RETAINED; m->reason=2; return;
+    }
+    m->evidence=NNPI_MAINT_ALL_EVIDENCE; m->reason=0;
+    m->state=NNPI_MAINT_QUIESCED;
+}
+static VOID NnpiMaintenanceRequest(PNNPI_DEVICE_CONTEXT c,WDFREQUEST request,
+    size_t outBytes,size_t inBytes,ULONG code)
+{
+    struct nnpi_maintenance_request in;
+    struct nnpi_maintenance_response out;
+    PVOID ib,ob; NTSTATUS status; ULONG_PTR bytes=0;
+    BOOLEAN prepare=code==NNPI_MAINTENANCE_PREPARE_IOCTL;
+    if (inBytes!=sizeof(in) || outBytes!=sizeof(out)) {
+        WdfRequestComplete(request,STATUS_INFO_LENGTH_MISMATCH); return;
+    }
+    status=WdfRequestRetrieveInputBuffer(request,sizeof(in),&ib,NULL);
+    if (!NT_SUCCESS(status)) goto end;
+    RtlCopyMemory(&in,ib,sizeof(in));
+    status=WdfRequestRetrieveOutputBuffer(request,sizeof(out),&ob,NULL);
+    if (!NT_SUCCESS(status)) goto end;
+    if (in.version!=NNPI_MAINTENANCE_VERSION || in.size!=sizeof(in) ||
+        in.reserved[0] || in.reserved[1] ||
+        (!prepare && (in.session || in.generation || in.epoch || in.attempt))) {
+        status=STATUS_INVALID_PARAMETER; goto end;
+    }
+    WdfWaitLockAcquire(c->CacheLock,NULL);
+    if (prepare) {
+        BOOLEAN first=!nnpi_maintenance_closed(&c->Maintenance);
+        if (c->Removed || c->Cache.flags!=NNPI_DIAG_PREPARED_D0 ||
+            !nnpi_maintenance_prepare(&c->Maintenance,&in,c->Boot.session_id,c->Cache.generation,c->Epoch)) {
+            status=STATUS_INVALID_PARAMETER; goto unlock;
+        }
+        if (first) {
+            /* Do NOT signal BootClose or set BootClosing before bulk drain. */
+            c->MaintenanceDeadline=KeQueryInterruptTime()+UINT64_C(1200000000);
+            c->Maintenance.boot_owned=c->Image.Enabler!=NULL || c->Dma.VirtualAddress!=NULL;
+            c->Maintenance.net_owned=c->NetDma.Enabler!=NULL;
+            c->Maintenance.bulk_owned=c->BulkDma.Enabler!=NULL;
+            c->Maintenance.producer_active=c->Boot.worker_active || c->Net.worker_active;
+            c->Maintenance.provider_retained=c->BootResetInterface.InterfaceDereference!=NULL;
+            if (!c->BootStarted) NnpiMaintenanceFinish(c);
+            else if (KeReadStateEvent(&c->BootDone) || c->BootSession.reset_used ||
+                     c->BootClosing || c->RuntimeFaultRetained) {
+                /* A cleanup already claimed before PREPARE is not this attempt's
+                 * reset. Never attach it retroactively or grant a fresh budget. */
+                c->Maintenance.state=NNPI_MAINT_RETAINED; c->Maintenance.reason=3;
+            }
+            KeSetEvent(&c->RuntimeWork,IO_NO_INCREMENT,FALSE);
+        }
+    }
+    out=c->Maintenance; out.version=NNPI_MAINTENANCE_VERSION; out.size=sizeof(out);
+    if (out.attempt && (c->Removed || c->Cache.flags!=NNPI_DIAG_PREPARED_D0 ||
+        out.generation!=c->Cache.generation || out.epoch!=c->Epoch)) {
+        out.state=NNPI_MAINT_RETAINED; out.reason=6; out.evidence=0;
+    }
+    if (!out.attempt) { out.session=c->Boot.session_id; out.generation=c->Cache.generation; out.epoch=c->Epoch; }
+    RtlCopyMemory(ob,&out,sizeof(out)); bytes=sizeof(out); status=STATUS_SUCCESS;
+unlock:
+    WdfWaitLockRelease(c->CacheLock);
+end:
+    WdfRequestCompleteWithInformation(request,status,bytes);
+}
 _Use_decl_annotations_
 VOID
 NnpiIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputBufferLength,
@@ -1449,6 +1728,13 @@ NnpiIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputBufferLengt
     NTSTATUS status;
     ULONG_PTR information = 0;
 
+    if (IoControlCode==NNPI_MAINTENANCE_PREPARE_IOCTL || IoControlCode==NNPI_MAINTENANCE_QUERY_IOCTL) {
+        NnpiMaintenanceRequest(context,Request,OutputBufferLength,InputBufferLength,IoControlCode); return;
+    }
+    if (IoControlCode==NNPI_BULK_BEGIN_IOCTL || IoControlCode==NNPI_BULK_QUERY_IOCTL) {
+        NnpiBulkRequest(NnpiGetContext(WdfIoQueueGetDevice(Queue)),Request,
+            OutputBufferLength,InputBufferLength,IoControlCode); return;
+    }
     if (IoControlCode==NNPI_BOOT_BEGIN_IOCTL || IoControlCode==NNPI_BOOT_CHUNK_IOCTL ||
         IoControlCode==NNPI_BOOT_SEAL_IOCTL || IoControlCode==NNPI_BOOT_SUBMIT_IOCTL ||
         IoControlCode==NNPI_BOOT_QUERY_IOCTL) {
@@ -1457,9 +1743,33 @@ NnpiIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputBufferLengt
     if (IoControlCode==NNPI_NET_BEGIN_IOCTL) {
         NnpiNetRequest(context,Request,OutputBufferLength,InputBufferLength,IoControlCode); return;
     }
+    if (IoControlCode==NNPI_PERF_QUERY_IOCTL) {
+        struct nnpi_perf_request query;
+        PVOID inBuffer,outBuffer;
+        if (InputBufferLength!=sizeof(query) || OutputBufferLength!=sizeof(context->Perf))
+            status=STATUS_INFO_LENGTH_MISMATCH;
+        else {
+            status=WdfRequestRetrieveInputBuffer(Request,sizeof(query),&inBuffer,NULL);
+            if (NT_SUCCESS(status)) {
+                RtlCopyMemory(&query,inBuffer,sizeof(query));
+                if (query.version!=NNPI_PERF_VERSION || query.size!=sizeof(query) || query.reserved[0] || query.reserved[1])
+                    status=STATUS_INVALID_PARAMETER;
+                else {
+                    status=WdfRequestRetrieveOutputBuffer(Request,sizeof(context->Perf),&outBuffer,NULL);
+                    if (NT_SUCCESS(status)) {
+                        WdfWaitLockAcquire(context->CacheLock,NULL);
+                        RtlCopyMemory(outBuffer,&context->Perf,sizeof(context->Perf));
+                        WdfWaitLockRelease(context->CacheLock);
+                        information=sizeof(context->Perf);
+                    }
+                }
+            }
+        }
+        WdfRequestCompleteWithInformation(Request,status,information); return;
+    }
     if (IoControlCode==NNPI_NET_DATA_QUERY_IOCTL || IoControlCode==NNPI_NET_TX_IOCTL ||
         IoControlCode==NNPI_NET_RX_CLAIM_IOCTL || IoControlCode==NNPI_NET_RX_RELEASE_IOCTL ||
-        IoControlCode==NNPI_NET_RX_BATCH_IOCTL) {
+        IoControlCode==NNPI_NET_RX_BATCH_IOCTL || IoControlCode==NNPI_NET_RX_WAIT_IOCTL) {
         NnpiNetDataRequest(context,Request,OutputBufferLength,InputBufferLength,IoControlCode); return;
     }
     if (IoControlCode==NNPI_RUNTIME_INFO_IOCTL) {
@@ -1473,6 +1783,14 @@ NnpiIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputBufferLengt
     }
     if (IoControlCode==NNPI_SYSINFO_QUERY_IOCTL) {
         NnpiSysinfoRequest(context,Request,OutputBufferLength,InputBufferLength,IoControlCode);
+        return;
+    }
+    if (IoControlCode==NNPI_HOSTWIN_QUERY_IOCTL) {
+        NnpiHostwinRequest(context,Request,OutputBufferLength,InputBufferLength);
+        return;
+    }
+    if (IoControlCode==NNPI_HOSTWIN_WRITE_IOCTL) {
+        NnpiHostwinWriteRequest(context,Request,OutputBufferLength,InputBufferLength);
         return;
     }
     /* This build is 026-only: spent 025/025A and separate reset/revalidate cannot
@@ -1592,7 +1910,7 @@ static VOID NnpiBootFail(PNNPI_DEVICE_CONTEXT c,ULONG Reason,NTSTATUS Status)
          * Closing/worker completion is NOT device-DMA cessation. */
         c->RuntimeFaultRetained=TRUE; c->NetData.stats.fault_retained=1;
         c->ResetBlocked=TRUE; c->BootClosing=TRUE; c->Boot.closing=1;
-        c->NetClosing=TRUE; c->Net.closing=1;
+        c->NetClosing=TRUE; c->Net.closing=1; NnpiRxWake(c);
         KeSetEvent(&c->BootClose,IO_NO_INCREMENT,FALSE);
         KeSetEvent(&c->NetClose,IO_NO_INCREMENT,FALSE);
     }
@@ -1631,9 +1949,7 @@ static NTSTATUS NnpiBootBudget(VOID)
 }
 static NTSTATUS NnpiBootSeal(PNNPI_DEVICE_CONTEXT c)
 {
-    static const UCHAR expected[32]={0x94,0xce,0x7a,0xf6,0xa1,0x0a,0x4f,0xa7,
-        0x58,0x0b,0xfe,0xd2,0xd7,0x43,0x7b,0xdb,0x23,0x34,0x81,0x06,
-        0x37,0x8a,0x63,0x04,0x96,0x12,0x9a,0xe3,0x9e,0xc2,0xf2,0xe1};
+    /* All reviewed image digests are compared by the identity allowlist. */
     /* Linux bootimage.c:83,257 EFI capsule GUID, little-endian wire fields.
      * Reject matching GUID even if a malicious capsule lies about its size. */
     static const UCHAR capsule[16]={0xed,0xd5,0xcb,0x6d,0x2d,0xe8,0x44,0x4c,
@@ -1666,7 +1982,7 @@ static NTSTATUS NnpiBootSeal(PNNPI_DEVICE_CONTEXT c)
     }
     status=BCryptFinishHash(hash,c->Boot.sha256,sizeof(c->Boot.sha256),0);
     if (!NT_SUCCESS(status)) goto End;
-    if (RtlCompareMemory(expected,c->Boot.sha256,sizeof(expected))!=sizeof(expected)) {
+    if (!nnpi_image_identity_matches(c->Boot.sha256,NNPI_IMAGE_BYTES)) {
         status=STATUS_DATA_ERROR; goto End;
     }
     c->Boot.sha256_verified=1;
@@ -1912,16 +2228,28 @@ Cleanup:
 CleanupLocked:
     /* Stop all net command producers BEFORE claiming the one boot-owner FLR.
      * Never join under CacheLock; provider reentrancy risk is unchanged. */
-    c->RuntimeHealthy=FALSE; c->NetClosing=TRUE; c->Net.closing=1;
+    c->RuntimeHealthy=FALSE; c->NetClosing=TRUE; c->Net.closing=1; NnpiRxWake(c);
     KeSetEvent(&c->NetClose,IO_NO_INCREMENT,FALSE);
     WdfWaitLockRelease(c->CacheLock);
-    KeWaitForSingleObject(&c->NetDone,Executive,KernelMode,FALSE,NULL);
+    {
+        LARGE_INTEGER done_to; done_to.QuadPart=-100000000; /* 10 s */
+        if (KeWaitForSingleObject(&c->NetDone,Executive,KernelMode,FALSE,&done_to)!=STATUS_SUCCESS)
+            c->RuntimeFaultRetained=TRUE;
+    }
     WdfWaitLockAcquire(c->CacheLock,NULL);
     c->ResetBlocked=TRUE; /* reset claim closes every legacy MMIO path too */
     NnpiIrqInvalidate(&c->IrqMapping); /* CPU-only: no cleanup MMIO. */
+    if (!nnpi_bulk_may_release(&c->Bulk)) {
+        nnpi_bulk_fault(&c->Bulk,3);
+        c->RuntimeFaultRetained=TRUE; /* No auto FLR against unresolved bulk DMA. */
+    }
     if (!c->RuntimeFaultRetained && c->BootSession.hostready_used && !c->BootSession.reset_used &&
         NnpiBootCurrent(c) && c->BootResetInterface.DeviceReset)
         resetCall=(BOOLEAN)nnpi_boot_session_reset_begin(&c->BootSession,&key);
+    if (nnpi_maintenance_closed(&c->Maintenance)) {
+        if (resetCall) { c->Maintenance.state=NNPI_MAINT_RESET_PENDING; c->Maintenance.reset_claims=1; }
+        else { c->Maintenance.state=NNPI_MAINT_RETAINED; if (!c->Maintenance.reason) c->Maintenance.reason=4; }
+    }
     NnpiBootSnapshot(c);
     WdfWaitLockRelease(c->CacheLock);
     if (resetCall) {
@@ -1942,6 +2270,10 @@ CleanupLocked:
         reset.call_returned=c->BootDiagnostic.ResetReturned; reset.call_status=(ULONG)status;
         reset.state=reset.call_returned && status==STATUS_SUCCESS ? NNPI_RESET_COMPLETE : NNPI_RESET_FAILED;
         WdfWaitLockAcquire(c->CacheLock,NULL);
+        if (nnpi_maintenance_closed(&c->Maintenance)) {
+            c->Maintenance.reset_returned=reset.call_returned;
+            c->Maintenance.reset_status=(ULONG)status;
+        }
         c->BootDiagnostic.ResetStatus=(ULONG)status;
         c->Boot.reset_status=(ULONG)status;
         if (nnpi_boot_session_stopped(&c->BootSession,&key,NNPI_BS_RESET_RETURN_ONLY,0,&reset)) {
@@ -1962,6 +2294,7 @@ CleanupLocked:
     c->BootWork=NULL;
     KeSetEvent(&c->BootDone,IO_NO_INCREMENT,FALSE);
     NnpiNetFinalize(c);
+    NnpiMaintenanceFinish(c);
     WdfWaitLockRelease(c->CacheLock);
     WdfObjectDereference(device); IoFreeWorkItem(work);
     ExReleaseRundownProtection(&NnpiSysinfoRundown);
@@ -1969,17 +2302,28 @@ CleanupLocked:
 }
 static VOID NnpiBootBarrier(PNNPI_DEVICE_CONTEXT c)
 {
-    BOOLEAN started,safe; LARGE_INTEGER delay;
+    BOOLEAN started,safe; LARGE_INTEGER delay; WDFREQUEST revoked; ULONG spins;
     WdfWaitLockAcquire(c->CacheLock,NULL);
     c->RuntimeHealthy=FALSE; c->BootClosing=TRUE; c->Boot.closing=1; started=c->BootStarted;
-    c->NetClosing=TRUE; c->Net.closing=1;
+    c->NetClosing=TRUE; c->Net.closing=1; NnpiRxWake(c);
     KeSetEvent(&c->NetClose,IO_NO_INCREMENT,FALSE);
     KeSetEvent(&c->BootClose,IO_NO_INCREMENT,FALSE);
+    revoked=NnpiRxRevokeLocked(c);
     WdfWaitLockRelease(c->CacheLock);
+    if (revoked) WdfRequestCompleteWithInformation(revoked,STATUS_DEVICE_NOT_READY,0);
+    if (c->RxWaitWork) WdfWorkItemFlush(c->RxWaitWork);
     if (!started) return;
-    KeWaitForSingleObject(&c->BootDone,Executive,KernelMode,FALSE,NULL);
+    {
+        LARGE_INTEGER done_to; done_to.QuadPart=-100000000; /* 10 s */
+        if (KeWaitForSingleObject(&c->BootDone,Executive,KernelMode,FALSE,&done_to)!=STATUS_SUCCESS) {
+            /* Boot worker stuck on an unresponsive card: never block the
+             * power IRP forever; retain the fault and let WDF tear down. */
+            c->RuntimeFaultRetained=TRUE;
+            return;
+        }
+    }
     delay.QuadPart=-5000000;
-    for (;;) {
+    for (spins=0;spins<400;++spins) {
         WdfWaitLockAcquire(c->CacheLock,NULL);
         safe=(BOOLEAN)(nnpi_boot_session_may_release(&c->BootSession,NNPI_BS_ALL_DMA) &&
             (!c->Dma.Published || c->Dma.StopConfirmed) &&
@@ -1989,6 +2333,7 @@ static VOID NnpiBootBarrier(PNNPI_DEVICE_CONTEXT c)
         /* Fail-stop BEFORE WDF parent Dispose, not merely a child reference. */
         KeDelayExecutionThread(KernelMode,FALSE,&delay);
     }
+    c->RuntimeFaultRetained=TRUE;
 }
 static VOID NnpiBootRequest(PNNPI_DEVICE_CONTEXT c,WDFREQUEST Request,
     size_t OutputBytes,size_t InputBytes,ULONG Code)
@@ -2019,7 +2364,7 @@ static VOID NnpiBootRequest(PNNPI_DEVICE_CONTEXT c,WDFREQUEST Request,
     if (!NT_SUCCESS(status)) goto End;
     WdfWaitLockAcquire(c->CacheLock,NULL);
     if (query) { status=STATUS_SUCCESS; goto Copy; }
-    if (c->Removed || c->BootClosing ||
+    if (nnpi_maintenance_closed(&c->Maintenance) || c->Removed || c->BootClosing ||
         c->Cache.flags!=NNPI_DIAG_PREPARED_D0 || input.image_bytes!=NNPI_BOOT_IMAGE_BYTES ||
         !input.generation || !input.epoch || input.generation==UINT64_MAX || input.epoch==UINT64_MAX ||
         input.generation!=c->Cache.generation || input.epoch!=c->Epoch) {
@@ -2102,6 +2447,7 @@ static VOID NnpiNetFail(PNNPI_DEVICE_CONTEXT c, ULONG Reason, NTSTATUS Status)
         c->Net.failed_stage=Reason; c->Net.ntstatus=(ULONG)Status;
     }
     nnpi_net_session_abort(&c->NetSession);
+    NnpiRxWake(c);
 }
 static VOID NnpiNetSnapshot(PNNPI_DEVICE_CONTEXT c)
 {
@@ -2133,7 +2479,7 @@ static ULONG NnpiNetGate(PNNPI_DEVICE_CONTEXT c,uint64_t generation,uint64_t epo
     g.boot_worker=c->BootStarted && c->Boot.worker_active &&
         !KeReadStateEvent(&c->BootDone);
     g.boot_phase=c->BootSession.phase; g.driver_ready=c->BootSession.driver_ready;
-    g.closing=c->BootClosing || c->NetClosing;
+    g.closing=nnpi_maintenance_closed(&c->Maintenance) || c->BootClosing || c->NetClosing;
     g.reset=c->ResetBlocked || c->BootSession.reset_used;
     g.failed=c->Boot.failed_stage || c->Net.failed_stage || c->BootSession.invalidated;
     g.started=c->NetStarted;
@@ -2192,12 +2538,51 @@ static BOOLEAN NnpiNetDataCurrent(PNNPI_DEVICE_CONTEXT c)
 {
     struct nnpi_net_session_key key;
     key.session_id=c->Net.session_id; key.generation=c->Net.generation; key.epoch=c->Net.epoch;
-    return !c->RuntimeFaultRetained && NnpiNetCurrent(c) && NnpiNetCommandGate(c) &&
+    return !nnpi_maintenance_closed(&c->Maintenance) && !c->RuntimeFaultRetained && NnpiNetCurrent(c) && NnpiNetCommandGate(c) &&
         nnpi_net_session_matches(&c->NetSession,&key) &&
         nnpi_net_owner_matches(&c->NetOwner,&c->BootSession,&key) &&
         c->NetSession.phase==NNPI_NS_READY && c->NetSession.eth_configured &&
         c->NetSession.chan_id==c->Net.chan_id && c->NetDma.Prepared &&
         c->NetDma.Published && !c->NetDma.StopConfirmed;
+}
+VOID NnpiRxWaitWork(WDFWORKITEM WorkItem)
+{
+    PNNPI_DEVICE_CONTEXT c=NnpiGetContext((WDFDEVICE)WdfWorkItemGetParentObject(WorkItem));
+    WDFREQUEST request; PVOID inBuffer,outBuffer;
+    struct nnpi_net_rx_batch_request input;
+    struct nnpi_net_rx_batch_response *batch;
+    NTSTATUS status; ULONG_PTR information=0;
+    WdfWaitLockAcquire(c->CacheLock,NULL);
+    if (NnpiNetDataCurrent(c) && c->NetConsumer &&
+        c->NetConsumerKey.session_id==c->Net.session_id &&
+        c->NetConsumerKey.generation==c->Net.generation &&
+        c->NetConsumerKey.epoch==c->Net.epoch && !c->NetData.stats.rx_queued) {
+        WdfWaitLockRelease(c->CacheLock); return;
+    }
+    request=NnpiRxRevokeLocked(c);
+    if (!request) { WdfWaitLockRelease(c->CacheLock); return; }
+    status=WdfRequestRetrieveInputBuffer(request,sizeof(input),&inBuffer,NULL);
+    if (!NT_SUCCESS(status)) goto Unlock;
+    RtlCopyMemory(&input,inBuffer,sizeof(input));
+    if (!NnpiNetDataCurrent(c) || c->NetConsumer!=WdfRequestGetFileObject(request) ||
+        NnpiGetFileContext(WdfRequestGetFileObject(request))->Cleaned ||
+        input.session_id!=c->Net.session_id || input.generation!=c->Net.generation ||
+        input.epoch!=c->Net.epoch || input.session_id!=c->NetConsumerKey.session_id ||
+        input.generation!=c->NetConsumerKey.generation || input.epoch!=c->NetConsumerKey.epoch) {
+        status=STATUS_DEVICE_NOT_READY; goto Unlock;
+    }
+    if (WdfRequestIsCanceled(request)) { status=STATUS_CANCELLED; goto Unlock; }
+    status=WdfRequestRetrieveOutputBuffer(request,sizeof(*batch),&outBuffer,NULL);
+    if (!NT_SUCCESS(status)) goto Unlock;
+    batch=(struct nnpi_net_rx_batch_response *)outBuffer;
+    RtlZeroMemory(batch,sizeof(*batch));
+    batch->version=NNPI_NET_RX_VERSION; batch->size=sizeof(*batch);
+    batch->session_id=input.session_id; batch->generation=input.generation; batch->epoch=input.epoch;
+    nnpi_net_data_dequeue(&c->NetData,input.max_frames,batch);
+    information=sizeof(*batch);
+Unlock:
+    WdfWaitLockRelease(c->CacheLock);
+    WdfRequestCompleteWithInformation(request,status,information);
 }
 static NTSTATUS NnpiNetReceiveDescriptor(PNNPI_DEVICE_CONTEXT c,uint64_t qw)
 {
@@ -2213,6 +2598,7 @@ static NTSTATUS NnpiNetReceiveDescriptor(PNNPI_DEVICE_CONTEXT c,uint64_t qw)
      * after copy/drop. A barrier is NOT substituted for noncoherent DMA sync. */
     KeMemoryBarrier();
     if (!nnpi_net_data_receive(&c->NetData,slot,length,page)) return STATUS_DEVICE_PROTOCOL_ERROR;
+    NnpiRxWake(c);
     return STATUS_SUCCESS;
 }
 /* Sole data command producer: called by BootRuntime under CacheLock, never by
@@ -2223,6 +2609,7 @@ static NTSTATUS NnpiNetDataPump(PNNPI_DEVICE_CONTEXT c)
 {
     unsigned n,j; uint8_t slot,bytes[8]; int ack,rc; uint64_t qw;
     ULONG command; struct nnpi_fifo_command_plan plan;
+    c->PumpSent=0; c->PumpFull=FALSE;
     if (!NnpiNetDataCurrent(c)) return STATUS_SUCCESS;
     for (n=0;n<NNPI_ETH_SLOTS;++n) {
         if (!nnpi_net_data_next(&c->NetData,(uint16_t)c->Net.chan_id,&qw,&slot,&ack)) break;
@@ -2231,13 +2618,24 @@ static NTSTATUS NnpiNetDataPump(PNNPI_DEVICE_CONTEXT c)
         for (j=0;j<8;++j) bytes[j]=(uint8_t)(qw>>(j*8));
         rc=nnpi_fifo_plan_command(command,bytes,sizeof(bytes),&plan);
         if (rc==NNPI_FIFO_NO_SPACE) {
-            nnpi_net_data_inc(&c->NetData.stats.fifo_full); break;
+            nnpi_net_data_inc(&c->NetData.stats.fifo_full);
+            c->PumpFull=TRUE;
+            c->Perf.fifo_full=nnpi_perf_add(c->Perf.fifo_full,1); break;
         }
         if (rc!=NNPI_FIFO_OK) return STATUS_DEVICE_DATA_ERROR;
         c->NetData.stats.last_emit_halves=0;
         NnpiNetEmit(c,&plan,&c->NetData.stats.last_emit_halves);
         if (c->NetData.stats.last_emit_halves!=2) return STATUS_DEVICE_PROTOCOL_ERROR;
         nnpi_net_data_sent(&c->NetData,slot,ack);
+        ++c->PumpSent;
+        if (ack) c->Perf.ack_sent=nnpi_perf_add(c->Perf.ack_sent,1);
+        else {
+            uint64_t elapsed=(uint64_t)KeQueryPerformanceCounter(NULL).QuadPart-c->TxQueuedQpc[slot];
+            c->Perf.tx_sent=nnpi_perf_add(c->Perf.tx_sent,1);
+            c->Perf.tx_latency_count=nnpi_perf_add(c->Perf.tx_latency_count,1);
+            c->Perf.tx_latency_ticks=nnpi_perf_add(c->Perf.tx_latency_ticks,elapsed);
+            if (elapsed>c->Perf.tx_latency_max) c->Perf.tx_latency_max=elapsed;
+        }
     }
     return STATUS_SUCCESS;
 }
@@ -2249,7 +2647,8 @@ static VOID NnpiNetRxRequest(PNNPI_DEVICE_CONTEXT c,WDFREQUEST Request,
     struct nnpi_net_rx_claim_response response={0};
     struct nnpi_net_rx_batch_response *batch;
     WDFFILEOBJECT file=WdfRequestGetFileObject(Request);
-    BOOLEAN receive=Code==NNPI_NET_RX_BATCH_IOCTL;
+    WDFREQUEST revoked=NULL;
+    BOOLEAN receive=Code==NNPI_NET_RX_BATCH_IOCTL || Code==NNPI_NET_RX_WAIT_IOCTL;
     if (InputBytes!=sizeof(input) || OutputBytes!=(receive?
         sizeof(struct nnpi_net_rx_batch_response):sizeof(response))) {
         status=STATUS_INFO_LENGTH_MISMATCH; goto End;
@@ -2297,6 +2696,15 @@ static VOID NnpiNetRxRequest(PNNPI_DEVICE_CONTEXT c,WDFREQUEST Request,
         status=STATUS_DEVICE_NOT_READY; goto Unlock;
     }
     if (receive) {
+        if (Code==NNPI_NET_RX_WAIT_IOCTL && !c->NetData.stats.rx_queued) {
+            ULONG queued=0;
+            (void)WdfIoQueueGetState(c->RxWaitQueue,&queued,NULL);
+            if (queued) { status=STATUS_DEVICE_BUSY; goto Unlock; }
+            status=WdfRequestForwardToIoQueue(Request,c->RxWaitQueue);
+            WdfWaitLockRelease(c->CacheLock);
+            if (!NT_SUCCESS(status)) WdfRequestCompleteWithInformation(Request,status,0);
+            return;
+        }
         batch=(struct nnpi_net_rx_batch_response *)outBuffer;
         RtlZeroMemory(batch,sizeof(*batch));
         batch->version=NNPI_NET_RX_VERSION; batch->size=sizeof(*batch);
@@ -2305,6 +2713,7 @@ static VOID NnpiNetRxRequest(PNNPI_DEVICE_CONTEXT c,WDFREQUEST Request,
         information=sizeof(*batch);
     } else {
         if (Code==NNPI_NET_RX_RELEASE_IOCTL) {
+            revoked=NnpiRxRevokeLocked(c);
             c->NetConsumer=NULL;
             RtlZeroMemory(&c->NetConsumerKey,sizeof(c->NetConsumerKey));
         }
@@ -2318,6 +2727,7 @@ static VOID NnpiNetRxRequest(PNNPI_DEVICE_CONTEXT c,WDFREQUEST Request,
 Unlock:
     WdfWaitLockRelease(c->CacheLock);
 End:
+    if (revoked) WdfRequestCompleteWithInformation(revoked,STATUS_CANCELLED,0);
     WdfRequestCompleteWithInformation(Request,status,information);
 }
 static VOID NnpiNetDataRequest(PNNPI_DEVICE_CONTEXT c,WDFREQUEST Request,
@@ -2329,7 +2739,7 @@ static VOID NnpiNetDataRequest(PNNPI_DEVICE_CONTEXT c,WDFREQUEST Request,
     struct nnpi_net_tx_response response={0}; int slot; unsigned i;
     BOOLEAN observe=Code==NNPI_NET_DATA_QUERY_IOCTL;
     WDFFILEOBJECT file=WdfRequestGetFileObject(Request);
-    if (Code==NNPI_NET_RX_CLAIM_IOCTL || Code==NNPI_NET_RX_RELEASE_IOCTL || Code==NNPI_NET_RX_BATCH_IOCTL) {
+    if (Code==NNPI_NET_RX_CLAIM_IOCTL || Code==NNPI_NET_RX_RELEASE_IOCTL || Code==NNPI_NET_RX_BATCH_IOCTL || Code==NNPI_NET_RX_WAIT_IOCTL) {
         NnpiNetRxRequest(c,Request,OutputBytes,InputBytes,Code); return;
     }
     if (InputBytes!=(observe?sizeof(query):sizeof(*tx)) ||
@@ -2391,7 +2801,16 @@ static VOID NnpiNetDataRequest(PNNPI_DEVICE_CONTEXT c,WDFREQUEST Request,
         RtlCopyMemory(page,tx->frame,tx->length);
         KeMemoryBarrier(); /* release CPU copy before later descriptor push */
         c->NetData.tx_lengths[slot]=(uint16_t)tx->length;
-        c->NetData.tx_pending=(uint16_t)(c->NetData.tx_pending|(1u<<slot));
+        {
+            BOOLEAN wake=c->NetData.tx_pending==0;
+            unsigned pending=0,bit;
+            c->TxQueuedQpc[slot]=(uint64_t)KeQueryPerformanceCounter(NULL).QuadPart;
+            c->NetData.tx_pending=(uint16_t)(c->NetData.tx_pending|(1u<<slot));
+            c->Perf.tx_enqueued=nnpi_perf_add(c->Perf.tx_enqueued,1);
+            for (bit=0;bit<NNPI_ETH_SLOTS;++bit) pending+=(c->NetData.tx_pending>>bit)&1u;
+            if (pending>c->Perf.tx_pending_high_water) c->Perf.tx_pending_high_water=pending;
+            if (wake) KeSetEvent(&c->RuntimeWork,IO_NO_INCREMENT,FALSE);
+        }
         response.version=NNPI_NET_DATA_VERSION; response.size=sizeof(response);
         response.session_id=c->Net.session_id; response.generation=c->Net.generation;
         response.epoch=c->Net.epoch; response.accepted=1; response.slot=(uint32_t)slot;
@@ -2586,16 +3005,24 @@ WorkerDoneLocked:
  * resets or joins Boot: Boot -> NetDone is the only worker dependency. */
 static VOID NnpiNetBarrier(PNNPI_DEVICE_CONTEXT c)
 {
-    BOOLEAN started,safe; LARGE_INTEGER delay;
+    BOOLEAN started,safe; LARGE_INTEGER delay; ULONG spins;
     WdfWaitLockAcquire(c->CacheLock,NULL);
-    c->NetClosing=TRUE; c->Net.closing=1;
+    c->NetClosing=TRUE; c->Net.closing=1; NnpiRxWake(c);
     KeSetEvent(&c->NetClose,IO_NO_INCREMENT,FALSE);
     started=c->NetStarted;
     WdfWaitLockRelease(c->CacheLock);
     if (!started) return;
-    KeWaitForSingleObject(&c->NetDone,Executive,KernelMode,FALSE,NULL);
+    {
+        LARGE_INTEGER done_to; done_to.QuadPart=-100000000; /* 10 s */
+        if (KeWaitForSingleObject(&c->NetDone,Executive,KernelMode,FALSE,&done_to)!=STATUS_SUCCESS) {
+            /* Net worker stuck on an unresponsive card: retain the fault and
+             * let the power IRP complete instead of bugchecking 0x9F. */
+            c->RuntimeFaultRetained=TRUE;
+            return;
+        }
+    }
     delay.QuadPart=-5000000;
-    for (;;) {
+    for (spins=0;spins<400;++spins) {
         WdfWaitLockAcquire(c->CacheLock,NULL);
         NnpiNetFinalize(c);
         safe=(BOOLEAN)(nnpi_net_session_may_release(&c->NetSession,NNPI_NS_ALL_DMA) &&
@@ -2605,6 +3032,7 @@ static VOID NnpiNetBarrier(PNNPI_DEVICE_CONTEXT c)
         if (safe) return;
         KeDelayExecutionThread(KernelMode,FALSE,&delay);
     }
+    c->RuntimeFaultRetained=TRUE;
 }
 static VOID NnpiNetRequest(PNNPI_DEVICE_CONTEXT c, WDFREQUEST Request,
     size_t OutputBytes, size_t InputBytes, ULONG Code)
@@ -2636,6 +3064,9 @@ static VOID NnpiNetRequest(PNNPI_DEVICE_CONTEXT c, WDFREQUEST Request,
     WdfWaitLockAcquire(c->CacheLock,NULL);
     if (query) { status=STATUS_SUCCESS; goto Copy; }
     if (input.session_id) { status=STATUS_INVALID_PARAMETER; goto Unlock; }
+    if (c->Bulk.phase && c->Bulk.phase!=NNPI_BULK_DONE) {
+        status=STATUS_DEVICE_BUSY; goto Unlock;
+    }
     if (NnpiNetGate(c,input.generation,input.epoch,input.chan_id,input.card_ip,
                     input.mac,FALSE)!=NNPI_NET_GATE_READY) {
         status=STATUS_DEVICE_NOT_READY; goto Unlock;
@@ -2686,19 +3117,245 @@ End:
     WdfRequestCompleteWithInformation(Request,status,information);
 }
 
+/* No device reset or disable/enable is retirement evidence for bulk. On lost
+ * DMA ownership retain WDF parents at the pre-disposal boundary. Maintenance
+ * recovery must establish hardware quiescence externally; no auto replay. */
+static VOID NnpiBulkBarrier(PNNPI_DEVICE_CONTEXT c)
+{
+    LARGE_INTEGER delay; BOOLEAN safe;
+    delay.QuadPart=-5000000;
+    for (;;) {
+        WdfWaitLockAcquire(c->CacheLock,NULL);
+        safe=(BOOLEAN)nnpi_bulk_may_release(&c->Bulk);
+        if (!safe) nnpi_bulk_fault(&c->Bulk,3);
+        WdfWaitLockRelease(c->CacheLock);
+        if (safe) return;
+        KeDelayExecutionThread(KernelMode,FALSE,&delay);
+    }
+}
+static VOID NnpiBulkRequest(PNNPI_DEVICE_CONTEXT c,WDFREQUEST Request,
+    size_t OutputBytes,size_t InputBytes,ULONG Code)
+{
+    struct nnpi_bulk_request in;
+    struct nnpi_bulk_response out={0};
+    struct nnpi_bulk_response_v2 detail={0};
+    size_t responseBytes=sizeof(out);
+    PVOID ib,ob; NTSTATUS status; ULONG_PTR information=0;
+    BOOLEAN query=(BOOLEAN)(Code==NNPI_BULK_QUERY_IOCTL);
+    if (InputBytes!=sizeof(in) || OutputBytes<sizeof(out)) {
+        WdfRequestComplete(Request,STATUS_INFO_LENGTH_MISMATCH); return;
+    }
+    status=WdfRequestRetrieveInputBuffer(Request,sizeof(in),&ib,NULL);
+    if (!NT_SUCCESS(status)) goto end;
+    RtlCopyMemory(&in,ib,sizeof(in));
+    if (query && in.version==NNPI_BULK_QUERY_VERSION) responseBytes=sizeof(detail);
+    if (OutputBytes<responseBytes) { status=STATUS_INFO_LENGTH_MISMATCH; goto end; }
+    status=WdfRequestRetrieveOutputBuffer(Request,responseBytes,&ob,NULL);
+    if (!NT_SUCCESS(status)) goto end;
+    if ((in.version!=NNPI_BULK_ABI_VERSION && !(query && in.version==NNPI_BULK_QUERY_VERSION)) || in.size!=sizeof(in) ||
+        (query && (in.session || in.generation || in.epoch || in.run || in.chunk_bytes || in.queue_depth || in.direction || in.reserved)) ||
+        (in.reserved&~1u) || in.direction>1 ||
+        (!query && ((in.chunk_bytes!=65536 && in.chunk_bytes!=262144 && in.chunk_bytes!=1048576) ||
+                    (in.queue_depth!=1 && in.queue_depth!=4)))) {
+        status=STATUS_INVALID_PARAMETER; goto end;
+    }
+    WdfWaitLockAcquire(c->CacheLock,NULL);
+    if (!query) {
+        if (nnpi_maintenance_closed(&c->Maintenance) || !c->RuntimeHealthy || !c->RuntimeCompatible || !NnpiBootCurrent(c) ||
+            c->BootClosing || c->Removed || c->RuntimeFaultRetained || c->Net.worker_active ||
+            in.session!=c->Boot.session_id || in.generation!=c->Boot.generation ||
+            in.epoch!=c->Boot.epoch || !nnpi_bulk_can_begin(&c->Bulk,in.run) ||
+            /* C2H only after a completed CAPS exchange proved this card
+             * advertises it; otherwise refuse before consuming a channel. */
+            (in.direction && (!c->Bulk.caps_seen || !(c->Bulk.card_caps&NNPI_BULK_CAP_C2H))) ||
+            c->BulkDma.Enabler ||
+            !nnpi_bulk_admission(c->Boot.sha256_verified,c->Boot.sha256,c->Boot.image_bytes,&c->RuntimeVersion)) {
+            status=STATUS_NOT_SUPPORTED; goto unlock;
+        }
+        {
+            ULONGLONG prepareStart=KeQueryInterruptTime();
+            ULONGLONG prepareElapsed;
+            status=NnpiBulkDmaPrepare(c->Device,&c->BulkDma,in.run,in.chunk_bytes,in.queue_depth,in.direction);
+            /* Per-run wall time, not CPU time; excludes the diagnostic itself. */
+            prepareElapsed=KeQueryInterruptTime()-prepareStart;
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID,DPFLTR_INFO_LEVEL,
+                "nnpi-bulk: run=%llu prepare_wall_100ns=%llu status=0x%08lx\n",
+                (unsigned long long)in.run,prepareElapsed,(ULONG)status);
+        }
+        if (!NT_SUCCESS(status)) goto unlock;
+        if (!nnpi_bulk_begin(&c->Bulk,in.session,in.generation,in.epoch,in.run,
+                KeQueryInterruptTime(),1,&c->RuntimeVersion)) {
+            (void)NnpiBulkDmaRelease(&c->BulkDma,&c->Bulk);
+            status=STATUS_INVALID_DEVICE_STATE; goto unlock;
+        }
+        c->Bulk.config=(in.chunk_bytes==65536?0u:in.chunk_bytes==262144?1u:2u)|(in.queue_depth==4?4u:0u)|(in.direction?8u:0u)|((in.reserved&1u)?16u:0u);
+        KeSetEvent(&c->RuntimeWork,IO_NO_INCREMENT,FALSE);
+    }
+    out.version=NNPI_BULK_ABI_VERSION; out.size=sizeof(out);
+    out.session=c->Bulk.session; out.generation=c->Bulk.generation;
+    out.epoch=c->Bulk.epoch; out.run=c->Bulk.run;
+    out.host_wall_100ns=c->Bulk.finished?c->Bulk.finished-c->Bulk.started:0;
+    out.phase=c->Bulk.phase; out.fault=c->Bulk.fault;
+    out.published=c->Bulk.published; out.mapped=c->Bulk.mapped;
+    out.completed_bytes=c->Bulk.completed_bytes; out.card_us=c->Bulk.card_us;
+    out.exec_status=c->Bulk.exec_status; out.completion_seen=c->Bulk.completion_seen;
+    out.stop_seen=c->Bulk.stop_seen; out.channel_issued=c->Bulk.channel_issued;
+    out.channel_destroyed=c->Bulk.channel_destroyed;
+    out.image_approved=(uint32_t)(c->Boot.sha256_verified &&
+        nnpi_bulk_image_approved(c->Boot.sha256,c->Boot.image_bytes));
+    if (responseBytes==sizeof(detail)) {
+        detail.base=out; detail.base.version=NNPI_BULK_QUERY_VERSION;
+        detail.base.size=sizeof(detail);
+        detail.fault_from_phase=c->Bulk.fault_from_phase;
+        detail.destroy_sent=c->Bulk.destroy_sent;
+        detail.destroy_seen=c->Bulk.channel_destroyed;
+        detail.channel=c->Bulk.channel;
+        detail.card_setup_ns=c->Bulk.card_setup_ns;
+        detail.card_window_ns=c->Bulk.card_window_ns;
+        detail.card_verify_ns=c->Bulk.card_verify_ns;
+        detail.chunk_bytes=65536u<<(2*(c->Bulk.config&3u));
+        detail.queue_depth=(c->Bulk.config&4u)?4u:1u;
+        detail.total_bytes=NNPI_BULK_BYTES; detail.stats_seen=c->Bulk.stats_seen;
+        detail.direction=(c->Bulk.config&8u)?1u:0u;
+        detail.verified_bytes=c->Bulk.verified_bytes;detail.verify_status=c->Bulk.verify_status;
+        detail.first_bad_offset=c->Bulk.first_bad_offset;
+        detail.expected_byte=c->Bulk.expected_byte;detail.actual_byte=c->Bulk.actual_byte;
+        detail.buffer_ownership_released=c->Bulk.dma_released;
+        detail.physical_reclaim_observed=0; /* WdfObjectDelete may defer destruction. */
+        detail.host_verify_100ns=c->Bulk.host_verify_ticks;
+        detail.end_to_end_100ns=c->Bulk.cleanup_finished?c->Bulk.cleanup_finished-c->Bulk.started:0;
+        detail.exec_submit_100ns=c->Bulk.exec_submitted;
+        detail.exec_complete_100ns=c->Bulk.finished;
+        if (c->Bulk.finished && c->Bulk.exec_submitted)
+            detail.exec_wall_100ns=c->Bulk.finished-c->Bulk.exec_submitted;
+        if (c->Bulk.cleanup_started)
+            detail.cleanup_wall_100ns=(c->Bulk.cleanup_finished?c->Bulk.cleanup_finished:
+                c->Bulk.observed_time)-c->Bulk.cleanup_started;
+        RtlCopyMemory(detail.phase_elapsed_100ns,c->Bulk.phase_elapsed,sizeof(detail.phase_elapsed_100ns));
+        if (c->Bulk.phase==NNPI_BULK_FAULT && c->Bulk.fault_from_phase<NNPI_BULK_DONE)
+            detail.phase_elapsed_100ns[c->Bulk.fault_from_phase]=c->Bulk.observed_time-c->Bulk.phase_started;
+        RtlCopyMemory(ob,&detail,sizeof(detail));
+    } else RtlCopyMemory(ob,&out,sizeof(out));
+    information=responseBytes;
+unlock:
+    WdfWaitLockRelease(c->CacheLock);
+end:
+    WdfRequestCompleteWithInformation(Request,status,information);
+}
+/* Only invoked by original PASSIVE runtime worker after parsing the ENTIRE
+ * received batch; one command per round, never wait for a reply here. */
+static NTSTATUS NnpiBulkPump(PNNPI_DEVICE_CONTEXT c)
+{
+    uint64_t q[3]; uint8_t bytes[24]; unsigned n,i,j;
+    ULONG command; uint32_t halves=0;
+    struct nnpi_fifo_command_plan plan; int rc;
+    nnpi_bulk_tick(&c->Bulk,KeQueryInterruptTime());
+    if (!c->Bulk.phase || c->Bulk.phase==NNPI_BULK_FAULT) return STATUS_SUCCESS;
+    if (c->Bulk.phase==NNPI_BULK_HOST_VERIFY) {
+        ULONGLONG verifyStart=KeQueryInterruptTime();
+        if((c->Bulk.config&8u) && c->Bulk.verify_status!=2) {
+            KeMemoryBarrier();
+            if(!nnpi_bulk_verify_step(&c->Bulk,(const uint8_t *)c->BulkDma.Data.VirtualAddress,
+                    (uint32_t)c->BulkDma.Data.MappedBytes)) {
+                nnpi_bulk_fault(&c->Bulk,3);return STATUS_DEVICE_DATA_ERROR;
+            }
+            c->Bulk.host_verify_ticks+=KeQueryInterruptTime()-verifyStart;
+            if(c->Bulk.verified_bytes!=NNPI_BULK_BYTES) return STATUS_SUCCESS;
+        }
+        if(!nnpi_bulk_may_release(&c->Bulk)) return STATUS_DEVICE_BUSY;
+        {
+            NTSTATUS released=NnpiBulkDmaRelease(&c->BulkDma,&c->Bulk);
+            if(!NT_SUCCESS(released)) return released;
+            c->Bulk.dma_released=1; /* Ownership withdrawn; physical reclaim unobserved. */
+            c->Bulk.phase_elapsed[NNPI_BULK_HOST_VERIFY]=KeQueryInterruptTime()-c->Bulk.phase_started;
+            c->Bulk.cleanup_finished=KeQueryInterruptTime();
+            c->Bulk.phase=NNPI_BULK_DONE;
+            c->Bulk.retired_mask|=1u<<(c->Bulk.channel-NNPI_BULK_CHANNEL);
+            c->Bulk.retired_run[c->Bulk.channel-NNPI_BULK_CHANNEL]=c->Bulk.run;
+        }
+        return STATUS_SUCCESS;
+    }
+    if (c->Bulk.phase==NNPI_BULK_DONE) {
+        BOOLEAN hadDma=(BOOLEAN)(c->BulkDma.Enabler!=NULL);
+        ULONGLONG releaseStart=KeQueryInterruptTime();
+        NTSTATUS releaseStatus=NnpiBulkDmaRelease(&c->BulkDma,&c->Bulk);
+        ULONGLONG releaseElapsed=KeQueryInterruptTime()-releaseStart;
+        /* Log only an actual release attempt, never every idle worker round. */
+        if (hadDma) DbgPrintEx(DPFLTR_IHVDRIVER_ID,DPFLTR_INFO_LEVEL,
+            "nnpi-bulk: run=%llu release_wall_100ns=%llu status=0x%08lx released=%u\n",
+            (unsigned long long)c->Bulk.run,releaseElapsed,(ULONG)releaseStatus,
+            (unsigned int)(NT_SUCCESS(releaseStatus) && !c->BulkDma.Enabler));
+        if (NT_SUCCESS(releaseStatus) && !c->BulkDma.Enabler) {
+            c->Bulk.dma_released=1;
+            c->Bulk.retired_mask|=1u<<(c->Bulk.channel-NNPI_BULK_CHANNEL);
+            c->Bulk.retired_run[c->Bulk.channel-NNPI_BULK_CHANNEL]=c->Bulk.run;
+        }
+        return releaseStatus;
+    }
+    if (c->Bulk.session!=c->Boot.session_id || c->Bulk.generation!=c->Boot.generation ||
+        c->Bulk.epoch!=c->Boot.epoch || !c->Boot.sha256_verified ||
+        !nnpi_bulk_image_approved(c->Boot.sha256,c->Boot.image_bytes) ||
+        !nnpi_bulk_tables(&c->RuntimeVersion)) {
+        nnpi_bulk_fault(&c->Bulk,3); return STATUS_SUCCESS;
+    }
+    n=nnpi_bulk_next(&c->Bulk,(uint64_t)c->BulkDma.ControlChain.LogicalAddress.QuadPart>>12,
+        (uint64_t)c->BulkDma.DataChain.LogicalAddress.QuadPart>>12,q);
+    if (!n) return STATUS_SUCCESS;
+    command=NnpiReadControlSnapshot(&c->SnapshotMapping,NNPI_SNAPSHOT_COMMAND_OFFSET);
+    for (i=0;i<n;++i) for(j=0;j<8;++j) bytes[i*8+j]=(uint8_t)(q[i]>>(8*j));
+    rc=nnpi_fifo_plan_command(command,bytes,n*8,&plan);
+    if (rc==NNPI_FIFO_NO_SPACE) return STATUS_SUCCESS;
+    if (rc!=NNPI_FIFO_OK) { nnpi_bulk_fault(&c->Bulk,4); return STATUS_DEVICE_DATA_ERROR; }
+    nnpi_bulk_publish_at(&c->Bulk,KeQueryInterruptTime());
+    if (c->Bulk.phase==NNPI_BULK_FAULT) return STATUS_SUCCESS;
+    __try { NnpiNetEmit(c,&plan,&halves); }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        nnpi_bulk_fault(&c->Bulk,4); return GetExceptionCode();
+    }
+    if (halves!=n*2) { nnpi_bulk_fault(&c->Bulk,4); return STATUS_DEVICE_PROTOCOL_ERROR; }
+    return STATUS_SUCCESS;
+}
+
+/* CacheLock held. Called only by the original runtime producer. */
+static BOOLEAN NnpiMaintenanceDrainLocked(PNNPI_DEVICE_CONTEXT c)
+{
+    if (c->Maintenance.state!=NNPI_MAINT_DRAINING) return FALSE;
+    if ((!c->Bulk.phase || (c->Bulk.phase==NNPI_BULK_DONE && c->Bulk.dma_released)) &&
+        !c->BulkDma.Enabler && nnpi_bulk_may_release(&c->Bulk)) {
+        /* Only now may BOOT leave its response/STOP/verify loop. */
+        c->BootClosing=TRUE; c->Boot.closing=1;
+        KeSetEvent(&c->BootClose,IO_NO_INCREMENT,FALSE);
+        c->RuntimeHealthy=FALSE; return TRUE;
+    }
+    if (KeQueryInterruptTime()>=c->MaintenanceDeadline || c->Bulk.phase==NNPI_BULK_FAULT) {
+        c->Maintenance.state=NNPI_MAINT_RETAINED; c->Maintenance.reason=5;
+        c->RuntimeFaultRetained=TRUE; c->RuntimeHealthy=FALSE; return TRUE;
+    }
+    return FALSE;
+}
 /* Runtime transport remains on the SAME hardware worker. Each poll reads at
  * most 16 QWs, ACKs once (two writes only for full depth), then parses retained
  * data. A lost/partial reply or unknown opcode terminates, never reissues query.
  * Ready keeps all DMA, device and code lifetime until the close/reset barrier. */
 static VOID NnpiBootRuntime(PNNPI_DEVICE_CONTEXT c)
 {
-    LARGE_INTEGER delay; ULONG rounds=0,partialRounds=0,count=0,i,command,card;
+    LARGE_INTEGER delay; ULONG count=0,i,command,card;
+    ULONGLONG now,waitStart,lockStart,burstStart=0,elapsed,lastActivity=0;
+    PVOID waits[2]={&c->BootClose,&c->RuntimeWork};
+    ULONG rounds=0; unsigned bin;
+    uint32_t verifiedBefore;
+    BOOLEAN again=FALSE,progress,ready,bulkReady,verifyContinue,spinPoll=FALSE;
+    struct nnpi_runtime_time timing;
+    struct nnpi_boot_session_key runtimeKey;
     struct nnpi_fifo_snapshot fifo={0};
     struct nnpi_runtime_message message={0};
     NTSTATUS status=STATUS_SUCCESS; int parsed,route;
-    delay.QuadPart=-5000000;
+    delay.QuadPart=-(LONGLONG)nnpi_runtime_wait_ticks(0);
+    nnpi_runtime_time_init(&timing,KeQueryInterruptTime());
     WdfWaitLockAcquire(c->CacheLock,NULL);
     c->RuntimeEntered=TRUE;
+    runtimeKey.session_id=c->Boot.session_id;
+    runtimeKey.generation=c->Boot.generation; runtimeKey.epoch=c->Boot.epoch;
     if (!NnpiBootCurrent(c) || c->BootClosing) { c->RuntimeHealthy=FALSE; WdfWaitLockRelease(c->CacheLock); return; }
     __try {
         c->BootDiagnostic.RuntimeStep=NnpiRuntimeCommandGate;
@@ -2719,13 +3376,52 @@ static VOID NnpiBootRuntime(PNNPI_DEVICE_CONTEXT c)
     WdfWaitLockRelease(c->CacheLock);
     if (!NT_SUCCESS(status)) return;
     for (;;) {
-        status=KeWaitForSingleObject(&c->BootClose,Executive,KernelMode,FALSE,&delay);
-        if (status==STATUS_SUCCESS) {
-            WdfWaitLockAcquire(c->CacheLock,NULL); c->RuntimeHealthy=FALSE;
-            WdfWaitLockRelease(c->CacheLock); return;
+        waitStart=(uint64_t)KeQueryPerformanceCounter(NULL).QuadPart;
+        if (!again) {
+            /* Busy rounds poll the ring; the timed path stays for quiet traffic. */
+            if (spinPoll) {
+                if (NNPI_RUNTIME_SPIN_US) KeStallExecutionProcessor(NNPI_RUNTIME_SPIN_US);
+                delay.QuadPart=0;
+            }
+            status=KeWaitForMultipleObjects(2,waits,WaitAny,Executive,KernelMode,FALSE,&delay,NULL);
+            rounds=0;
         }
+        lockStart=(uint64_t)KeQueryPerformanceCounter(NULL).QuadPart;
         WdfWaitLockAcquire(c->CacheLock,NULL);
-        if (!NnpiBootCurrent(c) || c->BootClosing) { c->RuntimeHealthy=FALSE; WdfWaitLockRelease(c->CacheLock); return; }
+        now=(uint64_t)KeQueryPerformanceCounter(NULL).QuadPart;
+        bin=nnpi_perf_bin(now-lockStart,c->Perf.qpc_frequency);
+        c->Perf.lock_bins[bin]=nnpi_perf_add(c->Perf.lock_bins[bin],1);
+        if (!again) {
+            burstStart=now;
+            bin=nnpi_perf_bin(lockStart-waitStart,c->Perf.qpc_frequency);
+            c->Perf.wait_bins[bin]=nnpi_perf_add(c->Perf.wait_bins[bin],1);
+            if (status==STATUS_WAIT_0) c->Perf.wait_close=nnpi_perf_add(c->Perf.wait_close,1);
+            else if (status==STATUS_WAIT_0+1) c->Perf.wait_work=nnpi_perf_add(c->Perf.wait_work,1);
+            else if (status==STATUS_TIMEOUT) c->Perf.wait_timeout=nnpi_perf_add(c->Perf.wait_timeout,1);
+            else {
+                c->Perf.wait_error=nnpi_perf_add(c->Perf.wait_error,1);
+                NnpiBootFail(c,NNPI_BOOT_FAIL_PROTOCOL,status);
+                c->RuntimeHealthy=FALSE; WdfWaitLockRelease(c->CacheLock); return;
+            }
+        }
+        /* Close wins even when it arrives after WaitAny selected work/timeout.
+         * Revalidate the entire boot gate on EVERY unlocked/relocked round. */
+        if (KeReadStateEvent(&c->BootClose) || !NnpiBootCurrent(c) || c->BootClosing ||
+            c->RuntimeFaultRetained || c->Boot.failed_stage || c->Boot.session_id!=runtimeKey.session_id ||
+            !nnpi_boot_session_matches(&c->BootSession,&runtimeKey)) {
+            c->RuntimeHealthy=FALSE; WdfWaitLockRelease(c->CacheLock); return;
+        }
+        if (NnpiMaintenanceDrainLocked(c)) { WdfWaitLockRelease(c->CacheLock); return; }
+        ++rounds; count=0; c->PumpSent=0; c->PumpFull=FALSE;
+        verifiedBefore=c->Bulk.verified_bytes;
+        now=KeQueryInterruptTime();
+        if (nnpi_runtime_time_expired(&timing,now,c->RuntimeCompatible)) {
+            NnpiBootFail(c,NNPI_BOOT_FAIL_TIMEOUT,STATUS_IO_TIMEOUT);
+            c->RuntimeHealthy=FALSE;
+            NnpiBootSnapshot(c);
+            WdfWaitLockRelease(c->CacheLock);
+            return;
+        }
         status=STATUS_SUCCESS;
         __try {
             c->BootDiagnostic.RuntimeStep=NnpiRuntimeCardGate;
@@ -2742,12 +3438,23 @@ static VOID NnpiBootRuntime(PNNPI_DEVICE_CONTEXT c)
             if (NT_SUCCESS(status)) for (i=0;i<count;++i) {
                 c->BootDiagnostic.RuntimeStep=NnpiRuntimeParse;
                 parsed=nnpi_runtime_push(&c->RuntimeParser,c->RuntimeWords[i],&message);
+                nnpi_runtime_partial_observe(&timing,KeQueryInterruptTime(),c->RuntimeParser.count);
                 c->BootDiagnostic.RuntimeParserResult=(ULONG)parsed;
                 c->BootDiagnostic.RuntimeParserResultValid=1;
                 if (parsed==NNPI_RUNTIME_MESSAGE) {
                     c->BootDiagnostic.RuntimeDecodedOpcode=message.opcode;
                     c->BootDiagnostic.RuntimeDecodedOpcodeValid=1;
                     c->RuntimeLastMessage=message;
+                    if (message.opcode==41) {
+                        if (!c->Bulk.phase || !nnpi_bulk_tables(&c->RuntimeVersion) ||
+                            !nnpi_bulk_image_approved(c->Boot.sha256,c->Boot.image_bytes) ||
+                            !nnpi_bulk_receive(&c->Bulk,&message,KeQueryInterruptTime())) {
+                            status=STATUS_DEVICE_PROTOCOL_ERROR; break;
+                        }
+                        continue;
+                    }
+                    if (message.opcode==4 && nnpi_bulk_receive(&c->Bulk,&message,KeQueryInterruptTime()))
+                        continue;
                     route=nnpi_runtime_route_frame(&message);
                     if (route==NNPI_RUNTIME_ROUTE_VERSION) {
                         c->BootDiagnostic.RuntimeStep=NnpiRuntimeCompatibility;
@@ -2787,9 +3494,12 @@ static VOID NnpiBootRuntime(PNNPI_DEVICE_CONTEXT c)
                     status=STATUS_DEVICE_PROTOCOL_ERROR; break;
                 }
             }
+            if (NT_SUCCESS(status) && c->RuntimeCompatible && !c->RuntimeParser.count)
+                status=NnpiBulkPump(c);
             if (NT_SUCCESS(status) && c->RuntimeCompatible)
                 status=NnpiNetDataPump(c);
-            if (NT_SUCCESS(status) && c->RuntimeCompatible) {
+            if (NT_SUCCESS(status) && nnpi_runtime_keepalive_due(&timing,
+                    KeQueryInterruptTime(),c->RuntimeCompatible)) {
                 c->BootDiagnostic.RuntimeStep=NnpiRuntimeKeepaliveStep;
                 status=NnpiRuntimeKeepalive(&c->HostReadyMapping,&c->RuntimeKeepalive);
                 if (NT_SUCCESS(status)) c->RuntimeKeepaliveUpdates=
@@ -2797,14 +3507,51 @@ static VOID NnpiBootRuntime(PNNPI_DEVICE_CONTEXT c)
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) { status=GetExceptionCode(); }
         if (NT_SUCCESS(status)) c->BootDiagnostic.RuntimeStep=NnpiRuntimeWait;
-        if (!c->RuntimeCompatible && ++rounds>=20 && NT_SUCCESS(status)) status=STATUS_IO_TIMEOUT;
-        if (c->RuntimeParser.count) {
-            if (++partialRounds>=20 && NT_SUCCESS(status)) status=STATUS_IO_TIMEOUT;
-        } else partialRounds=0;
+        now=KeQueryInterruptTime();
+        nnpi_runtime_partial_observe(&timing,now,c->RuntimeParser.count);
+        if (NT_SUCCESS(status) && nnpi_runtime_time_expired(&timing,now,c->RuntimeCompatible))
+            status=STATUS_IO_TIMEOUT;
         if (!NT_SUCCESS(status)) NnpiBootFail(c,
             status==STATUS_IO_TIMEOUT?NNPI_BOOT_FAIL_TIMEOUT:NNPI_BOOT_FAIL_PROTOCOL,status);
         c->RuntimeHealthy=(BOOLEAN)(NT_SUCCESS(status) && c->RuntimeCompatible);
         NnpiBootSnapshot(c);
+        /* Full owner/session/generation/health gate, not the phase enum alone. */
+        bulkReady=(BOOLEAN)(nnpi_bulk_active(&c->Bulk) && c->RuntimeHealthy && !c->BootClosing &&
+             !c->RuntimeFaultRetained && NnpiBootCurrent(c) &&
+             c->Bulk.session==c->Boot.session_id && c->Bulk.generation==c->Boot.generation &&
+             c->Bulk.epoch==c->Boot.epoch && c->Boot.sha256_verified &&
+             nnpi_bulk_image_approved(c->Boot.sha256,c->Boot.image_bytes) &&
+             nnpi_bulk_tables(&c->RuntimeVersion));
+        ready=(BOOLEAN)(NnpiNetDataCurrent(c) || bulkReady);
+        verifyContinue=(BOOLEAN)nnpi_bulk_verify_continue(&c->Bulk,bulkReady,
+            c->RuntimeParser.count,verifiedBefore);
+        /* Still check BootClose/RuntimeWork outside CacheLock on every verify
+         * turn, but do not sleep 2ms after a successful 64KiB local step. */
+        delay.QuadPart=verifyContinue?0:-(LONGLONG)nnpi_runtime_wait_ticks(ready);
+        progress=(BOOLEAN)(count || c->PumpSent);
+        {
+            uint64_t qpc=(uint64_t)KeQueryPerformanceCounter(NULL).QuadPart;
+            if (progress) lastActivity=qpc;
+            spinPoll=(BOOLEAN)(!verifyContinue && ready && lastActivity &&
+                qpc-lastActivity < (uint64_t)c->Perf.qpc_frequency/10);
+        }
+        c->Perf.rounds=nnpi_perf_add(c->Perf.rounds,1);
+        c->Perf.rx_qwords=nnpi_perf_add(c->Perf.rx_qwords,count);
+        if (!progress) c->Perf.empty_rounds=nnpi_perf_add(c->Perf.empty_rounds,1);
+        elapsed=(uint64_t)KeQueryPerformanceCounter(NULL).QuadPart-burstStart;
+        /* Bulk transport/no-progress retains the 2ms wait. Network burst
+         * eligibility/budget is unchanged outside local verify continuation. */
+        again=(BOOLEAN)(NT_SUCCESS(status) && NnpiNetDataCurrent(c) && progress && !c->PumpFull &&
+            (count==16 || c->NetData.tx_pending || c->NetData.rx_pending));
+        if (again && (rounds>=4 || elapsed>=c->Perf.qpc_frequency/4000)) {
+            if (rounds>=4) c->Perf.burst_round_limit=nnpi_perf_add(c->Perf.burst_round_limit,1);
+            else c->Perf.burst_time_limit=nnpi_perf_add(c->Perf.burst_time_limit,1);
+            if (c->NetData.tx_pending || c->NetData.rx_pending)
+                c->Perf.pending_at_limit=nnpi_perf_add(c->Perf.pending_at_limit,1);
+            again=FALSE;
+        }
+        if (verifyContinue) again=FALSE; /* take the zero-time event check */
+        if (again && rounds==1) c->Perf.bursts=nnpi_perf_add(c->Perf.bursts,1);
         WdfWaitLockRelease(c->CacheLock);
         if (!NT_SUCCESS(status)) return;
     }

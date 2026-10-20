@@ -357,3 +357,60 @@ NTSTATUS NnpiRuntimeKeepalive(NNPI_SNAPSHOT_MAPPING *Mapping,ULONG *Counter)
     WRITE_REGISTER_ULONG((volatile ULONG *)Mapping->Address,out);
     return STATUS_SUCCESS;
 }
+
+/* Host window (card CPU-Z inventory) lives at BAR2+NNPI_HOSTWIN_OFFSET. */
+VOID NnpiMapHostwin(const struct nnpi_diag_response *Diagnostic, NNPI_HOSTWIN_MAPPING *Mapping)
+{
+    uint64_t address=0; PHYSICAL_ADDRESS physical;
+    NnpiUnmapHostwin(Mapping);
+    Mapping->Reason=nnpi_hostwin_window(Diagnostic,&address);
+    if (Mapping->Reason!=NNPI_HOSTWIN_OK) return;
+    physical.QuadPart=(LONGLONG)address;
+    Mapping->Address=MmMapIoSpaceEx(physical,NNPI_HOSTWIN_SIZE,PAGE_READWRITE|PAGE_NOCACHE);
+    if (!Mapping->Address) Mapping->Reason=NNPI_HOSTWIN_MAP_FAILED;
+}
+VOID NnpiUnmapHostwin(NNPI_HOSTWIN_MAPPING *Mapping)
+{
+    PVOID old=nnpi_status_detach(&Mapping->Address);
+    Mapping->Reason=NNPI_HOSTWIN_NOT_READY;
+    if (old) MmUnmapIoSpace(old,NNPI_HOSTWIN_SIZE);
+}
+NTSTATUS NnpiReadHostwin(NNPI_HOSTWIN_MAPPING *Mapping,struct nnpi_hostwin_response *Response)
+{
+    volatile ULONG *base=(volatile ULONG *)Mapping->Address;
+    uint32_t magic,data_size;
+    RtlZeroMemory(Response,sizeof(*Response));
+    if (!base) return STATUS_DEVICE_NOT_READY;
+    /* Read magic+data_size first, then bound the copy. Magic and size are the
+     * only interpreted words; the payload is an opaque text blob. */
+    magic=READ_REGISTER_ULONG(base);
+    data_size=READ_REGISTER_ULONG(base+1);
+    if (magic==MAXULONG || data_size==MAXULONG) return STATUS_DEVICE_DATA_ERROR;
+    Response->magic_valid=(magic==NNPI_HOSTWIN_MAGIC);
+    Response->data_size=Response->magic_valid && data_size<=NNPI_HOSTWIN_DATA_MAX ? data_size : 0;
+    Response->read_bytes=NNPI_HOSTWIN_SIZE;
+    /* Copy the whole fixed window verbatim; the parser slices on data_size. */
+    RtlCopyMemory(Response->window,(PVOID)base,NNPI_HOSTWIN_SIZE);
+    return STATUS_SUCCESS;
+}
+/* Host->card write side of the same window. Publish order mirrors the card:
+ * payload first, then data_size, then the H2C magic last as the publish flag.
+ * The window is uncached MMIO, so the store reaches the card's inbound memory
+ * over PCIe directly; no cache flush is needed on the host. */
+NTSTATUS NnpiWriteHostwin(NNPI_HOSTWIN_MAPPING *Mapping,
+                          const struct nnpi_hostwin_write_request *Request,
+                          uint32_t *WrittenBytes)
+{
+    volatile ULONG *base=(volatile ULONG *)Mapping->Address;
+    uint32_t n=Request->data_size;
+    if (!base) return STATUS_DEVICE_NOT_READY;
+    /* Payload lives at bytes 8..8+n, past the magic + data_size words. */
+    if (n) {
+        RtlCopyMemory((PUCHAR)base+8,Request->data,n);
+        KeMemoryBarrier(); /* payload visible before size/magic publish */
+    }
+    WRITE_REGISTER_ULONG(base+1,n);
+    WRITE_REGISTER_ULONG(base,NNPI_HOSTWIN_MAGIC_H2C);
+    if (WrittenBytes) *WrittenBytes=n;
+    return STATUS_SUCCESS;
+}
