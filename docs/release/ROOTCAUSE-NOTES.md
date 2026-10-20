@@ -89,3 +89,21 @@ deadlocking.
    buffer) so the next crash is attributable.
 6. Acceptance: 20 GB sequential NBD traffic with `ring_full == 0`, no leaked slots, no
    card reboot, no host NMI.
+
+## Fix status (2026-10-20)
+
+Implemented in `card-driver/sphcs_chan_net.c`:
+
+- ACK bounds check (`skb_handle < s_c2h_handles`); invalid and duplicate ACKs
+  are counted (`s_c2h_bad_acks`) and dropped.
+- Per-slot ACK quarantine (20 ms) so a late duplicate cannot free a slot that
+  has already been handed to a new frame.
+- Lost-ACK reclaim after 2 s (`sphcs_net_c2h_reap`), called from TX and from a
+  delayed work item while the TX queue is stopped.
+- TX backpressure: `netif_stop_queue` below two free slots, `netif_wake_queue`
+  above four.
+- DMA-pool failure path now sends an ACK for the host's H2C slot.
+
+Build validation: vendor 5.7 kernel tree and Ubuntu 5.4 headers (`ION_STUB=1`)
+both build `sphcs.ko` with no errors or warnings. Hardware stress validation
+and the 20 GB acceptance run are still required before 1.0.0.
