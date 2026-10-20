@@ -45,12 +45,32 @@ insmod sphcs.ko mem_thr=25000 disable_p2p=1
 
 `disable_p2p=1` is required on this platform; the ION/P2P paths are not used.
 
-## Known issues (pre-1.0)
+## C2H handle lifecycle
 
-- C2H handle lifecycle under sustained load: ACK bounds/generation checks,
-  lost-ACK recovery and TX backpressure are being fixed. Until then, heavy
-  NBD traffic can exhaust the 16-slot ring and destabilize the card.
-- The C2H ring depth is a host/ card ABI constant; see
+The vendor path had three failure modes under sustained load:
+
+- an out-of-range ACK (8-bit wire handle, 16 slots) wrote past
+  `s_c2h_busy_handles`;
+- a duplicate ACK could free a slot already handed to a new frame;
+- a lost ACK leaked the slot forever, eventually reporting
+  `c2h ringbuffer full`.
+
+Fixes in `sphcs_chan_net.c`:
+
+- bounds check on every ACK; invalid/duplicate ACKs are counted and dropped;
+- per-slot quarantine after an ACK so a late duplicate cannot hit a reused slot;
+- lost-ACK reclaim after 2 s, driven by TX and a delayed work item while the
+  queue is stopped;
+- TX backpressure (`netif_stop_queue` below two free slots, wake above four);
+- ACK on the DMA-pool failure path so the host's H2C slot is not leaked.
+
+Remaining limitation: the ACK wire format carries no generation, so a duplicate
+delayed past the quarantine window is still ambiguous. A future ABI version
+should add a generation field to the descriptor.
+
+## Known issues
+
+- The C2H ring depth is a host/card ABI constant; see
   `windows-driver/include/nnpi_eth_protocol.h`.
 
 ## Provenance

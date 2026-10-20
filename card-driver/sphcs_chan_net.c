@@ -5,6 +5,7 @@
  ********************************************/
 
 #include "sphcs_chan_net.h"
+#include <linux/jiffies.h>
 #include "sphcs_cmd_chan.h"
 
 #if NNPI_DISABLE_SSH
@@ -65,6 +66,18 @@ static int s_dev_id = -1;
 static unsigned char s_mac_addr[ETH_ALEN];
 static pool_handle   s_net_dma_page_pool;
 static int           s_c2h_handles;
+static unsigned long *s_c2h_done_jiffies;	/* C2H DMA completion time */
+static unsigned long *s_c2h_free_jiffies;	/* last ACK free time */
+static unsigned long  s_c2h_reaped;		/* lost-ACK slots reclaimed */
+static unsigned long  s_c2h_bad_acks;		/* invalid or duplicate ACKs */
+static struct delayed_work s_c2h_reap_work;
+
+/* A lost ACK must not leak a slot forever: reclaim a slot once its DMA has
+ * completed and the host ACK did not arrive within this window. */
+#define SPHCS_C2H_ACK_TIMEOUT_MS	2000
+/* Do not reuse a slot immediately after its ACK; this absorbs duplicate ACKs
+ * before the slot can be handed to a new frame. */
+#define SPHCS_C2H_QUARANTINE_MS		20
 static uint8_t      *s_c2h_busy_handles;
 
 static struct net_device_stats *sphcs_net_dev_get_stats(struct net_device *dev)
@@ -125,6 +138,10 @@ static int sphcs_net_out_msg_dma_complete_callback(struct sphcs *sphcs,
 	struct net_dma_command_data *dma_data = (struct net_dma_command_data *)user_data;
 	union c2h_ChanEthernetMsgDscr msg;
 
+	if (dma_data->host_skb_handle >= 0 &&
+	    dma_data->host_skb_handle < s_c2h_handles)
+		s_c2h_done_jiffies[dma_data->host_skb_handle] = jiffies;
+
 	msg.value = 0;
 	msg.opcode = NNP_IPC_C2H_OP_CHAN_ETH_MSG_DSCR;
 	msg.chan_id = dma_data->chan->protocol_id;
@@ -148,6 +165,55 @@ static int sphcs_net_out_msg_dma_complete_callback(struct sphcs *sphcs,
 	return 0;
 }
 
+static int sphcs_net_c2h_free_slots(void)
+{
+	int i, free = 0;
+
+	for (i = 0; i < s_c2h_handles; i++)
+		if (!s_c2h_busy_handles[i])
+			free++;
+	return free;
+}
+
+/* Reclaim slots whose host ACK never arrived. The frame is already on the
+ * host; without an ACK the slot would otherwise stay busy forever. */
+static void sphcs_net_c2h_reap(void)
+{
+	unsigned long now = jiffies;
+	int i;
+
+	for (i = 0; i < s_c2h_handles; i++) {
+		if (!s_c2h_busy_handles[i] || !s_c2h_done_jiffies[i])
+			continue;
+		if (time_after(now, s_c2h_done_jiffies[i] +
+			       msecs_to_jiffies(SPHCS_C2H_ACK_TIMEOUT_MS))) {
+			s_c2h_busy_handles[i] = 0;
+			s_c2h_free_jiffies[i] = now;
+			s_c2h_reaped++;
+		}
+	}
+}
+
+/* Lost ACKs stop the TX queue; this work reaps stale slots and wakes it. */
+static void sphcs_net_c2h_reap_work(struct work_struct *work)
+{
+	int wake = 0;
+
+	if (!s_net_cmd_chan || !s_net_dev)
+		return;
+	NNP_SPIN_LOCK_BH(&s_net_cmd_chan->c2h_rb[0].lock_bh);
+	sphcs_net_c2h_reap();
+	if (sphcs_net_c2h_free_slots() > 4)
+		wake = 1;
+	NNP_SPIN_UNLOCK_BH(&s_net_cmd_chan->c2h_rb[0].lock_bh);
+	if (wake && netif_queue_stopped(s_net_dev)) {
+		netif_wake_queue(s_net_dev);
+		return;
+	}
+	if (netif_queue_stopped(s_net_dev))
+		schedule_delayed_work(&s_c2h_reap_work, msecs_to_jiffies(500));
+}
+
 static int sphcs_net_dev_start_xmit(struct sk_buff *skb, struct net_device *netdev)
 {
 	struct net_dma_command_data dma_data;
@@ -158,6 +224,7 @@ static int sphcs_net_dev_start_xmit(struct sk_buff *skb, struct net_device *netd
 	u32 skb_size = skb->len;
 	u32 skb_size_aligned;
 	u32 skb_data_offset;
+	int stop_q = 0;
 	int c2h_skb_handle;
 	dma_addr_t write_host_dma_addr;
 	uint32_t cont;
@@ -184,14 +251,31 @@ static int sphcs_net_dev_start_xmit(struct sk_buff *skb, struct net_device *netd
 
 	/* allocate page in the c2h ring buffer */
 	NNP_SPIN_LOCK_BH(&s_net_cmd_chan->c2h_rb[0].lock_bh);
-	for (c2h_skb_handle = 0; c2h_skb_handle < s_c2h_handles; c2h_skb_handle++)
-		if (!s_c2h_busy_handles[c2h_skb_handle]) {
-			s_c2h_busy_handles[c2h_skb_handle] = 1;
-			break;
-		}
+	sphcs_net_c2h_reap();
+	for (c2h_skb_handle = 0; c2h_skb_handle < s_c2h_handles; c2h_skb_handle++) {
+		if (s_c2h_busy_handles[c2h_skb_handle])
+			continue;
+		/* Quarantine: a duplicate ACK for the previous frame must not
+		 * free a slot already handed to a new frame. */
+		if (s_c2h_free_jiffies[c2h_skb_handle] &&
+		    time_before(jiffies, s_c2h_free_jiffies[c2h_skb_handle] +
+				msecs_to_jiffies(SPHCS_C2H_QUARANTINE_MS)))
+			continue;
+		s_c2h_busy_handles[c2h_skb_handle] = 1;
+		s_c2h_done_jiffies[c2h_skb_handle] = 0;
+		break;
+	}
+	if (c2h_skb_handle < s_c2h_handles && sphcs_net_c2h_free_slots() <= 2)
+		stop_q = 1;
 	NNP_SPIN_UNLOCK_BH(&s_net_cmd_chan->c2h_rb[0].lock_bh);
+	if (stop_q) {
+		netif_stop_queue(netdev);
+		schedule_delayed_work(&s_c2h_reap_work, msecs_to_jiffies(500));
+	}
 
 	if (c2h_skb_handle >= s_c2h_handles) {
+		netif_stop_queue(netdev);
+		schedule_delayed_work(&s_c2h_reap_work, msecs_to_jiffies(500));
 		sph_log_err(ETH_LOG, "SPH_NET - c2h ringbuffer full\n");
 		s_net_dev->stats.tx_dropped++;
 		kfree_skb(skb);
@@ -204,6 +288,7 @@ static int sphcs_net_dev_start_xmit(struct sk_buff *skb, struct net_device *netd
 	if (!write_host_dma_addr || cont < skb_size) {
 		s_net_dev->stats.tx_dropped++;
 		kfree_skb(skb);
+		s_c2h_free_jiffies[c2h_skb_handle] = jiffies;
 		s_c2h_busy_handles[c2h_skb_handle] = 0;
 		return 0;
 	}
@@ -217,6 +302,7 @@ static int sphcs_net_dev_start_xmit(struct sk_buff *skb, struct net_device *netd
 		sph_log_debug(ETH_LOG, "SPH_NET - Failed to map skb for dma xfer\n");
 		s_net_dev->stats.tx_dropped++;
 		kfree_skb(skb);
+		s_c2h_free_jiffies[c2h_skb_handle] = jiffies;
 		s_c2h_busy_handles[c2h_skb_handle] = 0;
 		return 0;
 	}
@@ -305,6 +391,23 @@ static int sphcs_net_dev_init(uint32_t h2c_pages, uint32_t c2h_pages)
 		return -1;
 	}
 
+	s_c2h_done_jiffies = kcalloc(c2h_pages, sizeof(unsigned long), GFP_KERNEL);
+	s_c2h_free_jiffies = kcalloc(c2h_pages, sizeof(unsigned long), GFP_KERNEL);
+	if (!s_c2h_done_jiffies || !s_c2h_free_jiffies) {
+		sph_log_err(START_UP_LOG, "Failed to allocate C2H slot state\n");
+		kfree(s_c2h_busy_handles);
+		s_c2h_busy_handles = NULL;
+		kfree(s_c2h_done_jiffies);
+		s_c2h_done_jiffies = NULL;
+		kfree(s_c2h_free_jiffies);
+		s_c2h_free_jiffies = NULL;
+		free_netdev(s_net_dev);
+		dma_page_pool_destroy(s_net_dma_page_pool);
+		return -1;
+	}
+
+	INIT_DELAYED_WORK(&s_c2h_reap_work, sphcs_net_c2h_reap_work);
+
 	dma_page_pool_init_debugfs(s_net_dma_page_pool,
 				   g_the_sphcs->debugfs_dir,
 				   "chan_net_dma_page_pool");
@@ -323,9 +426,14 @@ static void sphcs_net_dev_exit(void)
 {
 	sph_log_info(ETH_LOG, "SPH_NET - Unloading sph network module\n\n");
 	if (s_net_dev != NULL) {
+		cancel_delayed_work_sync(&s_c2h_reap_work);
 		unregister_netdev(s_net_dev);
 		free_netdev(s_net_dev);
 		dma_page_pool_destroy(s_net_dma_page_pool);
+		kfree(s_c2h_done_jiffies);
+		s_c2h_done_jiffies = NULL;
+		kfree(s_c2h_free_jiffies);
+		s_c2h_free_jiffies = NULL;
 		kfree(s_c2h_busy_handles);
 		s_net_dev = NULL;
 		s_net_cmd_chan = NULL;
@@ -422,6 +530,7 @@ static int sphcs_net_process_command(struct sphcs              *sphcs,
 
 	if (ret) {
 		sph_log_err(ETH_LOG, "SPH_NET - Failed to get free DMA page\n");
+		sphcs_net_send_ack(cmd_chan, req->skb_handle);
 		sphcs_cmd_chan_put(cmd_chan);
 		return ret;
 	}
@@ -468,7 +577,22 @@ static void netmsg_op_work_handler(struct work_struct *work)
 						 work);
 
 	if (op->cmd.is_ack) {
-		s_c2h_busy_handles[op->cmd.skb_handle] = 0;
+		unsigned int h = op->cmd.skb_handle;
+		int wake = 0;
+
+		NNP_SPIN_LOCK_BH(&op->chan->c2h_rb[0].lock_bh);
+		if (h < (unsigned int)s_c2h_handles && s_c2h_busy_handles[h]) {
+			s_c2h_busy_handles[h] = 0;
+			s_c2h_free_jiffies[h] = jiffies;
+			if (sphcs_net_c2h_free_slots() > 4)
+				wake = 1;
+		} else {
+			/* Duplicate/invalid ACK: never index outside the array. */
+			s_c2h_bad_acks++;
+		}
+		NNP_SPIN_UNLOCK_BH(&op->chan->c2h_rb[0].lock_bh);
+		if (wake && s_net_dev && netif_queue_stopped(s_net_dev))
+			netif_wake_queue(s_net_dev);
 		sphcs_cmd_chan_put(op->chan);
 		goto free_op;
 	}
