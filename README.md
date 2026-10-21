@@ -91,9 +91,34 @@ The first three are covered here; the fourth is covered only as far as why it
 stopped.
 
 The state values, timeouts and message formats below come from the driver's
-protocol implementation and from actual runs. I never obtained or
-disassembled the card-side boot agent, so statements about its behaviour go
-only as far as the protocol and the observed state transitions support.
+protocol implementation and from actual runs. The card-side boot agent runs
+from the card's own firmware. I unpacked that firmware and looked at it
+statically, but I never executed or stepped through the agent, so statements
+about its behaviour go only as far as the protocol, the static view and the
+observed state transitions support.
+
+### What the card firmware shows
+
+The card carries its own firmware, separate from the host BIOS. It unpacks
+into the usual DXE module tree. The image was parsed as a firmware-volume
+tree, one PE32 section at a time, and the 1100 and 1150 dumps were compared
+module by module. One of those modules is the host-facing part of the boot
+path, and it is byte-identical in both dumps. It contains a host-interface
+library, a shared-mailbox implementation, and a function that sends a
+doorbell to the host.
+
+The strings around them — `HostInterfaceLib`, `SendDoorbellToHost`, "Shared
+mailbox is not ready", "Already started" — match the model the driver uses:
+the host writes commands into a mailbox and the card rings a doorbell. The
+same module also carries generic platform code, so it is a platform module
+with the NNP-I host interface built in, not a purpose-written agent.
+
+This confirms that the mailbox and doorbell side exists on the card and is
+not a host-side fiction. It does not give the message layouts: I did not
+reconstruct the opcode table or the state machine from the card binary. The
+sections below still describe the driver's side plus what the doorbell
+reported at run time. Firmware, module binaries, disassembly and symbol
+addresses are not published.
 
 ### 1. Topology and responsibility boundaries
 
@@ -533,12 +558,14 @@ actual runs:
 - the 5 ms runtime poll and keepalive range 1..14;
 - network lifecycle opcodes 22/23/57 and events 21/23/39.
 
-I did not obtain the card-side boot agent. The card-side Linux was only
-observed at runtime; I did not analyse its source. Statements such as "the
-card reads the table", or "the card-side network driver configures the
-interface", rest on the protocol semantics, the state transitions and
-observable behaviour after boot, not on a line-by-line analysis of card
-code.
+I did not execute or step through the card-side boot agent. The card
+firmware was only inspected statically: enough to see the host-interface,
+shared-mailbox and doorbell code, not enough to recover its opcode table.
+The card-side Linux was only observed at runtime; I did not analyse its
+source. Statements such as "the card reads the table", or "the card-side
+network driver configures the interface", rest on the protocol semantics,
+the state transitions and observable behaviour after boot, plus the static
+view above, not on a line-by-line reconstruction of card code.
 
 Register offsets, bit-field tables, vendor source, firmware, boot images and
 private keys are not in this repository. What is here stops at stages and
@@ -762,8 +789,9 @@ normal block device, used to benchmark the host-side storage path.
 
 ## What is not here
 
-I left out the vendor driver source and headers, the firmware, the boot
-images, the SSH keys and the register tables. The first four are either
+I left out the vendor driver source and headers, the firmware, the
+disassembly of that firmware, the boot images, the SSH keys and the register
+tables. The first four are either
 proprietary or sensitive, and the register tables are the part of the work I
 am not putting in public. That also means the direct-MMIO experiments cannot
 be rerun from this repo alone; the notes describe what was tried and what
