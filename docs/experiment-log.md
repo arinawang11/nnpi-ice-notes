@@ -166,3 +166,26 @@ DiskSpd 交叉验证（4K QD32，`-Sh` 无缓存）：写 59,249 IOPS /
 这个镜像没有 sshd/telnetd，根文件系统仍在 initramfs 里。要拿到可登录的
 系统，下一步得做磁盘根和远程登录，这也正好是驱动需要重构的部分：
 卡端要能读主机磁盘或 VHDX。
+
+## 10. 卡端持久化：TCP NBD 与写回修正（2026-10-22）
+
+卡端 root 在 RAM，之前用 raw 隧道挂 nbd0，切到网络后 SSH 和存储互斥。
+这一轮把存储挪到 net-bridge 上：主机 `nbd-server.py --proto newstyle`
+监听 10810，后端 `\\.\PHYSICALDRIVE4`（16 GiB VHDX），卡端 nbd-client 3.20
+以 `-n` 连 `/dev/nbd1`，挂到 `/mnt/vhdx`。SSH、命令邮箱和存储同时可用。
+
+协议和运维细节见 [storage-tcp-nbd.md](storage-tcp-nbd.md)，脚本见
+`card-runtime/storage/`。
+
+实测：64 MiB 冷读 26.46 秒（约 2.5 MB/s）；邮箱经同一设备返回 RC=0；
+RAM 根的增量写回 23.7 秒。
+
+这一轮还定位了一个“数据丢失”误报。写回脚本原来是
+`rsync -aHX --delete / /mnt/vhdx/`：VHDX 同时是卡侧存储，`--delete` 会删掉
+只存在于挂载点的文件；而全根扫描（含 /usr/share/gnome 等数万文件）在
+2.5 MB/s 下超过 5 分钟周期，常在走到 /usr/local 前被切链路打断，打补丁的
+脚本只留在 RAM。去掉 `--delete`、排除静态树和缓存、加 flock、传播 rsync
+退出码、周期改为 3 min/15 min 后，单次 24 秒；VHDX-only 文件存活、RAM
+文件被镜像，三个脚本在两侧的 sha256 一致。
+
+待验证：下一次卡端重启后，新脚本和 15 分钟定时器是否自动生效。

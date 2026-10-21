@@ -466,7 +466,10 @@ TTL 64。
 `docs/` 是笔记：架构、实验记录、固件核查、主机环境、卡端运行环境、
 排错，还有主机侧迁到 Windows 需要做哪些事。[卡端访问主机磁盘的可行性](docs/storage-mapping.md)
 单独写了一篇，分层说明块级服务、钉页窗口和直接访问内存这三条路各自能
-走到哪。
+走到哪。[storage-tcp-nbd.md](docs/storage-tcp-nbd.md) 记录已经实现的
+TCP NBD 路径和实测边界。
+
+`card-runtime/storage/` 是卡端挂载 NBD、写回 RAM 根和命令邮箱的脚本。
 
 `experiments/pytorch-cpu/` 是卡端 CPU 运行时的部署脚本。
 `experiments/iscsi-ram-lun/` 是用 CrystalDiskMark 给主机存储路径跑分的
@@ -497,6 +500,24 @@ CDM 的随机测试只有一条线程、队列深度 32，会吃满一个核，�
 同一块卷和脚本以后可以直接指向卡侧内存后端，只改 target 的读写路径。
 协议细节和 14 个 Windows 侧的坑在 `experiments/iscsi-ram-lun/README.md`，
 按时间记录在 `docs/experiment-log.md`。
+
+## 卡端持久化存储
+
+卡端启动后 root 在 RAM 里，重启即丢。主机上的 16 GiB VHDX 通过现有的
+TAP 链路以 newstyle NBD 导出（`windows-driver/tools/nbd-server.py`，端口
+10810），卡端接到 `/dev/nbd1`，挂到 `/mnt/vhdx`。SSH、命令邮箱和块设备
+共用同一条以太网路径，不再需要单独的 raw 隧道。
+
+- 卡端脚本在 `card-runtime/storage/`。
+- `nnpi-tcpstore.service` 等主机服务器就绪后自动重连、挂载；
+  `mint-sync.timer` 每 15 分钟把 RAM 根写回挂载点。
+- 写回不带 `--delete`，并排除大型静态镜像树。单次约 24 秒；在 2.5 MB/s
+  的链路上扫全根跑不完一个启动周期，早先的补丁就是这样丢的。
+- 实测：冷读 2.5 MB/s（64 MiB）、邮箱在同一设备上往返成功、完整写回
+  23.7 秒。
+
+协议细节、失败模式和待做的重启验证见
+[docs/storage-tcp-nbd.md](docs/storage-tcp-nbd.md)。
 
 ## 编译驱动
 

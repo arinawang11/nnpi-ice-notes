@@ -1,0 +1,9 @@
+[Unit]
+Description=Periodic NNPI Mint RAM-root writeback
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

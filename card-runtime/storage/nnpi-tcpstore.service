@@ -1,0 +1,13 @@
+[Unit]
+Description=NNPI TCP storage attach (NBD over net-bridge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/nnpi-tcpstore.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

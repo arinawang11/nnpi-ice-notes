@@ -97,6 +97,11 @@ L2，不是 L1 能解决的。
 4. 都没有，再决定是重建卡端镜像加模块，还是做共享环。
 5. L2 只在拿到证据之后再谈。
 
+现状（2026-10-22）：卡端 `nbd` 可用，第 2 步已经落地——16 GiB VHDX 通过
+net-bridge 上的 TCP NBD 挂到卡端，协议、脚本和实测见
+[storage-tcp-nbd.md](storage-tcp-nbd.md)。第 3 步的 iSCSI 仍只用于主机侧
+跑分。
+
 ## 6. 和通用 Linux 启动实验的关系
 
 通用 Linux 能启动之后，卡端 rootfs 由我们控制，`nbd`、`iscsi_tcp` 都可以

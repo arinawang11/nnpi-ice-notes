@@ -1,0 +1,11 @@
+[Unit]
+Description=NNPI VHDX command mailbox
+DefaultDependencies=no
+
+[Service]
+ExecStart=/usr/local/bin/nnpi-mailbox.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=sysinit.target

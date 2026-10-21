@@ -594,7 +594,11 @@ vendor source or binaries.
 host setup, the card runtime, troubleshooting, and a write-up of what moving
 the host side to Windows involves. [Storage mapping](docs/storage-mapping.md)
 is separate: it lays out the three levels of card-to-host disk access and what
-each one actually buys.
+each one actually buys. [storage-tcp-nbd.md](docs/storage-tcp-nbd.md) records
+the implemented TCP NBD path and its measured limits.
+
+`card-runtime/storage/` holds the card-side NBD attach, RAM-root write-back
+and command-mailbox scripts.
 
 `experiments/pytorch-cpu/` is the deployment path for the CPU runtime.
 `experiments/iscsi-ram-lun/` is an iSCSI RAM LUN that gives CrystalDiskMark a
@@ -627,6 +631,27 @@ The same volume and scripts can later point at a card-side memory backend;
 only the target's read/write path changes. Protocol notes and 14 Windows-side
 pitfalls are in `experiments/iscsi-ram-lun/README.md`; the dated entry is in
 `docs/experiment-log.md`.
+
+## Card-side persistent storage
+
+The card boots into a RAM root, so nothing survives a reboot by itself. A
+16 GiB VHDX on the host is exported over the existing TAP link as a newstyle
+NBD target (`windows-driver/tools/nbd-server.py`, port 10810) and attached on
+the card as `/dev/nbd1` at `/mnt/vhdx`. SSH, the command mailbox and the block
+device share one Ethernet path; there is no separate raw tunnel.
+
+- The card-side pieces are in `card-runtime/storage/`.
+- `nnpi-tcpstore.service` reconnects and remounts after the host starts the
+  server; `mint-sync.timer` writes the RAM root back to the mount every
+  15 minutes.
+- The write-back runs without `--delete` and skips large immutable image
+  trees. That keeps a pass at about 24 seconds; a full-root walk at 2.5 MB/s
+  never finished inside one boot, which is how earlier patches were lost.
+- Measured: 2.5 MB/s cold read (64 MiB), mailbox round trip over the same
+  device, and a complete write-back pass in 23.7 seconds.
+
+Full protocol notes, failure modes and the remaining reboot check are in
+[docs/storage-tcp-nbd.md](docs/storage-tcp-nbd.md).
 
 ## Building the driver
 

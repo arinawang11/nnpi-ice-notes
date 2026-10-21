@@ -1,0 +1,9 @@
+[Unit]
+Description=NNPI Mint RAM-root writeback
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mint-sync.sh
+Nice=10
+IOSchedulingClass=idle
