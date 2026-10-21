@@ -9,7 +9,8 @@
 结论先放在前面：卡能上电，主机接口能通，加速器的配置能读，卡上的 x86
 也能启动 Linux。但 DELPHI 始终没有跑起来。负责给它派发任务的 TLC 固件
 （`cve_image*.bin`）在我手上的镜像、驱动包和归档里都找不到。x86 那边的
-PyTorch 倒是能正常用，而且速度不算差。
+PyTorch 倒是能正常用，而且速度不算差。现在还能 SSH 登录，并挂一块
+跨重启保留的磁盘。
 
 ## 驱动发布状态
 
@@ -454,28 +455,39 @@ TTL 64。
 
 这说明启动路径与载荷无关，普通发行版内核也能在卡上跑起来。现在还不是一个
 可登录的系统：这个镜像没有 sshd 或 telnetd，而且仍然整个跑在 initramfs 里。
-下一步是做磁盘根文件系统和远程登录。
+下一步是做磁盘根文件系统和远程登录。两件事现在都成了：登录走
+“网络和 SSH”，磁盘走“存储”。
 
-## 仓库里有什么
+## 网络和 SSH
 
-`windows-driver/` 是我自己写的 KMDF 驱动，针对 `45c6` 这个 function，
-另外还有一个小的命令行工具和一个 TAP 桥接程序。驱动负责设备信息查询、
-加载卡端镜像的 boot 协议，以及以太网的配置和数据通道。里面没有厂商的
-源码或二进制。
+桥接程序把驱动的以太网通道接到 TAP-Windows6 网卡上。它需要上游的
+`tap-windows.h`，这个头文件没有复制进仓库：
 
-`docs/` 是笔记：架构、实验记录、固件核查、主机环境、卡端运行环境、
-排错，还有主机侧迁到 Windows 需要做哪些事。[卡端访问主机磁盘的可行性](docs/storage-mapping.md)
-单独写了一篇，分层说明块级服务、钉页窗口和直接访问内存这三条路各自能
-走到哪。[storage-tcp-nbd.md](docs/storage-tcp-nbd.md) 记录已经实现的
-TCP NBD 路径和实测边界。
+```powershell
+msbuild tools\nnpi-net-bridge.vcxproj /p:Configuration=Release /p:Platform=x64 `
+        /p:NnpiTapIncludeDir=C:\path\to\tap-windows6\include
+```
 
-`card-runtime/storage/` 是卡端挂载 NBD、写回 RAM 根和命令邮箱的脚本。
+先建一个 TAP 网卡，记下它的 GUID，再找到卡在本机的设备实例 ID（每台
+机器都不一样）。然后：
 
-`experiments/pytorch-cpu/` 是卡端 CPU 运行时的部署脚本。
-`experiments/iscsi-ram-lun/` 是用 CrystalDiskMark 给主机存储路径跑分的
-iSCSI RAM LUN。
+```powershell
+nnpi-net-bridge.exe --device-instance 'PCI\VEN_8086&DEV_45C6&SUBSYS_...' `
+  --tap-guid '{...}' --session <id> --generation <n> --epoch 1
+```
 
-## 存储路径跑分
+session id 来自驱动的 BEGIN 响应。同一个设备不要重复起两个桥接进程；
+正常退出时它会把 I/O 排空并释放占用。
+
+卡端镜像是要自备的，仓库里没有。你需要一个能启动、并且会配置网卡的
+镜像。我用的配置是主机 TAP 地址 `192.168.115.1/24`，卡端
+`192.168.115.2/24`，但这只是我这边的情况。卡能响应之后，
+`ssh root@192.168.115.2` 就应该能连上。更多细节在
+`docs/host-setup.md`。同一条桥也承载卡端块存储，见“存储”。
+
+## 存储
+
+### 主机侧跑分
 
 CrystalDiskMark 只认普通块设备，所以把 PCIe function 藏在一个小的 iSCSI
 target 后面：四个 RAM LUN、四条 Windows 会话、一个动态盘条带卷（`G:`，
@@ -501,7 +513,10 @@ CDM 的随机测试只有一条线程、队列深度 32，会吃满一个核，�
 协议细节和 14 个 Windows 侧的坑在 `experiments/iscsi-ram-lun/README.md`，
 按时间记录在 `docs/experiment-log.md`。
 
-## 卡端持久化存储
+上面量的是链路的主机侧。下面转到卡侧：同一条以太网通路被导出成
+NBD target，挂到卡上，作为重启后仍在的磁盘。
+
+### 卡端持久化存储
 
 卡端启动后 root 在 RAM 里，重启即丢。主机上的 16 GiB VHDX 通过现有的
 TAP 链路以 newstyle NBD 导出（`windows-driver/tools/nbd-server.py`，端口
@@ -518,6 +533,33 @@ TAP 链路以 newstyle NBD 导出（`windows-driver/tools/nbd-server.py`，端�
 
 协议细节、失败模式和待做的重启验证见
 [docs/storage-tcp-nbd.md](docs/storage-tcp-nbd.md)。
+
+## 卡上的 PyTorch
+
+卡上没有包管理器，也没法联网装东西，所以运行时是打成 tar 包传过去的。
+先在 WSL 里准备一个独立的 CPython 3.8 x86_64 版本，再准备好要用的
+wheel（`torch 2.4.1+cpu`、对应版本的 torchvision、numpy，可选
+onnxruntime 1.16.3），放到 `/root/card-py` 下：
+
+```
+py/
+wheels/
+wheels3/
+wheels4/        # 可选
+```
+
+然后：
+
+```bash
+export NNPI_SSH_KEY=/path/to/key
+export NNPI_CARD=root@192.168.115.2
+experiments/pytorch-cpu/deploy.sh
+```
+
+脚本会把所有东西流式传到 `/tmp/card-py`，离线解包，导入成功后会打印一行
+版本信息。ResNet18 的结果和主机参考逐位一致。根文件系统是 initramfs，
+重启会把 `/tmp/card-py` 清掉，需要重新部署一次。“存储”里的持久盘
+可以跨重启保留；部署脚本目前仍指向 `/tmp`，我还没有搬过去。
 
 ## 编译驱动
 
@@ -560,58 +602,24 @@ done
 桥接程序也有一个 mock 测试：`g++ -std=c++17 -I include -o /tmp/tb
 tools/tests/test_bridge.cpp && /tmp/tb`。
 
-## 网络和 SSH
+## 仓库里有什么
 
-桥接程序把驱动的以太网通道接到 TAP-Windows6 网卡上。它需要上游的
-`tap-windows.h`，这个头文件没有复制进仓库：
+`windows-driver/` 是我自己写的 KMDF 驱动，针对 `45c6` 这个 function，
+另外还有一个小的命令行工具和一个 TAP 桥接程序。驱动负责设备信息查询、
+加载卡端镜像的 boot 协议，以及以太网的配置和数据通道。里面没有厂商的
+源码或二进制。
 
-```powershell
-msbuild tools\nnpi-net-bridge.vcxproj /p:Configuration=Release /p:Platform=x64 `
-        /p:NnpiTapIncludeDir=C:\path\to\tap-windows6\include
-```
+`docs/` 是笔记：架构、实验记录、固件核查、主机环境、卡端运行环境、
+排错，还有主机侧迁到 Windows 需要做哪些事。[卡端访问主机磁盘的可行性](docs/storage-mapping.md)
+单独写了一篇，分层说明块级服务、钉页窗口和直接访问内存这三条路各自能
+走到哪。[storage-tcp-nbd.md](docs/storage-tcp-nbd.md) 记录已经实现的
+TCP NBD 路径和实测边界。
 
-先建一个 TAP 网卡，记下它的 GUID，再找到卡在本机的设备实例 ID（每台
-机器都不一样）。然后：
+`card-runtime/storage/` 是卡端挂载 NBD、写回 RAM 根和命令邮箱的脚本。
 
-```powershell
-nnpi-net-bridge.exe --device-instance 'PCI\VEN_8086&DEV_45C6&SUBSYS_...' `
-  --tap-guid '{...}' --session <id> --generation <n> --epoch 1
-```
-
-session id 来自驱动的 BEGIN 响应。同一个设备不要重复起两个桥接进程；
-正常退出时它会把 I/O 排空并释放占用。
-
-卡端镜像是要自备的，仓库里没有。你需要一个能启动、并且会配置网卡的
-镜像。我用的配置是主机 TAP 地址 `192.168.115.1/24`，卡端
-`192.168.115.2/24`，但这只是我这边的情况。卡能响应之后，
-`ssh root@192.168.115.2` 就应该能连上。更多细节在
-`docs/host-setup.md`。
-
-## 卡上的 PyTorch
-
-卡上没有包管理器，也没法联网装东西，所以运行时是打成 tar 包传过去的。
-先在 WSL 里准备一个独立的 CPython 3.8 x86_64 版本，再准备好要用的
-wheel（`torch 2.4.1+cpu`、对应版本的 torchvision、numpy，可选
-onnxruntime 1.16.3），放到 `/root/card-py` 下：
-
-```
-py/
-wheels/
-wheels3/
-wheels4/        # 可选
-```
-
-然后：
-
-```bash
-export NNPI_SSH_KEY=/path/to/key
-export NNPI_CARD=root@192.168.115.2
-experiments/pytorch-cpu/deploy.sh
-```
-
-脚本会把所有东西流式传到 `/tmp/card-py`，离线解包，导入成功后会打印一行
-版本信息。ResNet18 的结果和主机参考逐位一致。根文件系统是 initramfs，
-重启会把 `/tmp/card-py` 清掉，需要重新部署一次。
+`experiments/pytorch-cpu/` 是卡端 CPU 运行时的部署脚本。
+`experiments/iscsi-ram-lun/` 是用 CrystalDiskMark 给主机存储路径跑分的
+iSCSI RAM LUN。
 
 ## 没有放出来的东西
 

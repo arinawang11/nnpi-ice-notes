@@ -12,7 +12,8 @@ the accelerator's configuration, and boot a Linux image on the x86 cores.
 I could not get DELPHI to execute anything. The firmware that dispatches
 work to it (TLC, `cve_image*.bin`) is not in any image, driver package or
 archive I have. The x86 cores do run PyTorch, and that part works well
-enough to be useful.
+enough to be useful. They also get an SSH login and a disk that survives a
+reboot.
 
 ## Driver release status
 
@@ -579,32 +580,42 @@ Two things cost time and are worth writing down:
   never reach the card.
 
 This shows the boot path is payload-agnostic and that an ordinary
-distribution kernel runs on the card. It is not yet a shell: this image has
+distribution kernel runs on the card. It was not yet a shell: this image has
 no sshd or telnetd, and everything still runs from initramfs. A disk-backed
-root and a remote login are the next step.
+root and a remote login were the next step. Both work now: Network and SSH
+covers the login, and Storage covers the disk.
 
-## What is in the repo
+## Network and SSH
 
-`windows-driver/` is my own KMDF driver for the `45c6` function, plus a small
-CLI and a TAP bridge. It handles device info, the boot protocol used to load
-an image, and the Ethernet control and data channel. It does not contain any
-vendor source or binaries.
+The bridge connects the driver's Ethernet channel to a TAP-Windows6 adapter.
+It needs the upstream `tap-windows.h`, which is not copied here:
 
-`docs/` has the notes: architecture, the experiment log, the firmware audit,
-host setup, the card runtime, troubleshooting, and a write-up of what moving
-the host side to Windows involves. [Storage mapping](docs/storage-mapping.md)
-is separate: it lays out the three levels of card-to-host disk access and what
-each one actually buys. [storage-tcp-nbd.md](docs/storage-tcp-nbd.md) records
-the implemented TCP NBD path and its measured limits.
+```powershell
+msbuild tools\nnpi-net-bridge.vcxproj /p:Configuration=Release /p:Platform=x64 `
+        /p:NnpiTapIncludeDir=C:\path\to\tap-windows6\include
+```
 
-`card-runtime/storage/` holds the card-side NBD attach, RAM-root write-back
-and command-mailbox scripts.
+Create a TAP adapter, note its GUID, and find the device instance ID for your
+card (it differs per machine). Then:
 
-`experiments/pytorch-cpu/` is the deployment path for the CPU runtime.
-`experiments/iscsi-ram-lun/` is an iSCSI RAM LUN that gives CrystalDiskMark a
-normal block device, used to benchmark the host-side storage path.
+```powershell
+nnpi-net-bridge.exe --device-instance 'PCI\VEN_8086&DEV_45C6&SUBSYS_...' `
+  --tap-guid '{...}' --session <id> --generation <n> --epoch 1
+```
 
-## Storage path benchmark
+The session id comes from the driver's BEGIN response. Do not start the bridge
+twice for the same device; it drains I/O and releases the claim on exit.
+
+The card image is not in this repo. You need one that boots and configures its
+network interface. A common setup is host TAP at `192.168.115.1/24` and the
+card at `192.168.115.2/24`, but that is just the configuration I used. Once
+the card answers, `ssh root@192.168.115.2` should work. More detail is in
+`docs/host-setup.md`. The same bridge also carries the card's block storage,
+described under Storage.
+
+## Storage path
+
+### Host-side benchmark
 
 CrystalDiskMark only talks to a block device, so the PCIe function is hidden
 behind a small iSCSI target: four RAM LUNs, four Windows sessions, one
@@ -632,7 +643,11 @@ only the target's read/write path changes. Protocol notes and 14 Windows-side
 pitfalls are in `experiments/iscsi-ram-lun/README.md`; the dated entry is in
 `docs/experiment-log.md`.
 
-## Card-side persistent storage
+That benchmark measures the host side of the link. The next part is the
+card side: the same Ethernet path, exported as an NBD target and mounted on
+the card as a disk that survives a reboot.
+
+### Card-side persistent storage
 
 The card boots into a RAM root, so nothing survives a reboot by itself. A
 16 GiB VHDX on the host is exported over the existing TAP link as a newstyle
@@ -652,6 +667,35 @@ device share one Ethernet path; there is no separate raw tunnel.
 
 Full protocol notes, failure modes and the remaining reboot check are in
 [docs/storage-tcp-nbd.md](docs/storage-tcp-nbd.md).
+
+## PyTorch on the card
+
+The card has no package manager and no network install path, so the runtime
+is copied over as a tarball. Prepare a standalone CPython 3.8 x86_64 build
+and the wheels you need (`torch 2.4.1+cpu`, the matching torchvision, numpy,
+and optionally onnxruntime 1.16.3). Put them under `/root/card-py` in WSL:
+
+```
+py/
+wheels/
+wheels3/
+wheels4/        # optional
+```
+
+Then:
+
+```bash
+export NNPI_SSH_KEY=/path/to/key
+export NNPI_CARD=root@192.168.115.2
+experiments/pytorch-cpu/deploy.sh
+```
+
+The script streams everything to `/tmp/card-py`, unpacks the wheels offline,
+and prints a version line when the imports work. ResNet18 matches the host
+reference bit for bit. The rootfs is an initramfs, so a reboot wipes
+`/tmp/card-py` and you have to deploy again. The persistent store described
+under Storage survives a reboot; the deployment script still targets `/tmp`,
+and I have not moved it.
 
 ## Building the driver
 
@@ -695,59 +739,26 @@ done
 The bridge has a mock test too: `g++ -std=c++17 -I include -o /tmp/tb
 tools/tests/test_bridge.cpp && /tmp/tb`.
 
-## Network and SSH
+## What is in the repo
 
-The bridge connects the driver's Ethernet channel to a TAP-Windows6 adapter.
-It needs the upstream `tap-windows.h`, which is not copied here:
+`windows-driver/` is my own KMDF driver for the `45c6` function, plus a small
+CLI and a TAP bridge. It handles device info, the boot protocol used to load
+an image, and the Ethernet control and data channel. It does not contain any
+vendor source or binaries.
 
-```powershell
-msbuild tools\nnpi-net-bridge.vcxproj /p:Configuration=Release /p:Platform=x64 `
-        /p:NnpiTapIncludeDir=C:\path\to\tap-windows6\include
-```
+`docs/` has the notes: architecture, the experiment log, the firmware audit,
+host setup, the card runtime, troubleshooting, and a write-up of what moving
+the host side to Windows involves. [Storage mapping](docs/storage-mapping.md)
+is separate: it lays out the three levels of card-to-host disk access and what
+each one actually buys. [storage-tcp-nbd.md](docs/storage-tcp-nbd.md) records
+the implemented TCP NBD path and its measured limits.
 
-Create a TAP adapter, note its GUID, and find the device instance ID for your
-card (it differs per machine). Then:
+`card-runtime/storage/` holds the card-side NBD attach, RAM-root write-back
+and command-mailbox scripts.
 
-```powershell
-nnpi-net-bridge.exe --device-instance 'PCI\VEN_8086&DEV_45C6&SUBSYS_...' `
-  --tap-guid '{...}' --session <id> --generation <n> --epoch 1
-```
-
-The session id comes from the driver's BEGIN response. Do not start the bridge
-twice for the same device; it drains I/O and releases the claim on exit.
-
-The card image is not in this repo. You need one that boots and configures its
-network interface. A common setup is host TAP at `192.168.115.1/24` and the
-card at `192.168.115.2/24`, but that is just the configuration I used. Once
-the card answers, `ssh root@192.168.115.2` should work. More detail is in
-`docs/host-setup.md`.
-
-## PyTorch on the card
-
-The card has no package manager and no network install path, so the runtime
-is copied over as a tarball. Prepare a standalone CPython 3.8 x86_64 build
-and the wheels you need (`torch 2.4.1+cpu`, the matching torchvision, numpy,
-and optionally onnxruntime 1.16.3). Put them under `/root/card-py` in WSL:
-
-```
-py/
-wheels/
-wheels3/
-wheels4/        # optional
-```
-
-Then:
-
-```bash
-export NNPI_SSH_KEY=/path/to/key
-export NNPI_CARD=root@192.168.115.2
-experiments/pytorch-cpu/deploy.sh
-```
-
-The script streams everything to `/tmp/card-py`, unpacks the wheels offline,
-and prints a version line when the imports work. ResNet18 matches the host
-reference bit for bit. The rootfs is an initramfs, so a reboot wipes
-`/tmp/card-py` and you have to deploy again.
+`experiments/pytorch-cpu/` is the deployment path for the CPU runtime.
+`experiments/iscsi-ram-lun/` is an iSCSI RAM LUN that gives CrystalDiskMark a
+normal block device, used to benchmark the host-side storage path.
 
 ## What is not here
 
