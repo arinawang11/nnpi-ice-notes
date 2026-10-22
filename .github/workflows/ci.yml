@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  protocol-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [c11, cpp17]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run offline tests
+        run: |
+          set -eu
+          mkdir -p /tmp/nnpi-tests
+          for src in windows-driver/tests/test_*.c; do
+            name=$(basename "$src" .c)
+            if [ "${{ matrix.language }}" = "c11" ]; then
+              gcc -std=c11 -Wall -Wextra "$src" -o "/tmp/nnpi-tests/$name"
+            else
+              g++ -x c++ -std=c++17 -Wall -Wextra "$src" -o "/tmp/nnpi-tests/$name"
+            fi
+            timeout 60 "/tmp/nnpi-tests/$name"
+          done
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile Python tools
+        run: python -m py_compile windows-driver/tools/*.py image-builder/*.py
+      - name: Run NBD server protocol tests
+        run: python -m unittest discover -s windows-driver/tools/tests -p 'test_nbd_server.py' -v

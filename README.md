@@ -30,7 +30,7 @@ See `windows-driver/README.md` and `docs/release/` for install, safety, the
 release plan and the card-side root-cause notes.
 
 **Hardware validation (2026-10-20).** A locally built image (vendor 5.7 kernel,
-patched `sphcs`, Alpine initramfs; test build 0.3.0.44 of this code) booted on
+patched `sphcs`, Alpine initramfs; a test build of this code) booted on
 the card and served a 15 GiB sequential NBD read over the raw tunnel: `rc=0`,
 the `NNPISTRESS DONE` marker was written at the disk tail, the card stayed in
 phase 9 with no reset or reboot, and the host logged no 0x80 NMI, no WHEA and

@@ -26,7 +26,7 @@ PyTorch 倒是能正常用，而且速度不算差。现在还能 SSH 登录，�
 `docs/release/`。
 
 **硬件验证（2026-10-20）。** 用本地构建的镜像（vendor 5.7 内核 + 打补丁的
-`sphcs` + Alpine initramfs；验证用的是这份代码的测试构建 0.3.0.44）在卡上
+`sphcs` + Alpine initramfs；验证用的是这份代码的测试构建）在卡上
 启动，通过 raw tunnel 连续读取 15 GiB NBD 数据：`rc=0`，盘尾
 `NNPISTRESS DONE` 标记写入成功，卡全程停在 phase 9，没有复位或重启，宿主
 没有 0x80 NMI、没有 WHEA、没有 0x9F（约 10.2 MB/s，约 24 分钟）。这越过了

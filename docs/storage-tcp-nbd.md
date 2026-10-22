@@ -43,10 +43,12 @@ net-bridge 把 TAP 和卡的以太网数据通道接起来；SSH 和 NBD 都是�
 - 选项号：`EXPORT_NAME=1`、`ABORT=2`、`INFO=6`、`GO=7`。
 - 传输标志 `HAS_FLAGS(0x1) | SEND_FLUSH(0x4) | SEND_TRIM(0x20) = 0x25`。
   bit1 是 **READ_ONLY**，误置会把 ext4 挂成只读。
-- 卡端用 `-b 4096` 和 4 KiB 块；写入路径每个 `CMD_WRITE` 都 `fsync`，
-  `CMD_FLUSH` 也落盘。
+- 卡端用 `-b 4096`，内核会把相邻请求合并，实测平均 113 KiB。`CMD_WRITE`
+  只写后端文件，`CMD_FLUSH` 才 `fsync` 落盘；服务器在 FLUSH 完成后才回确认。
 - 裸卷没有文件长度，服务器必须用 `--size` 指定导出大小；普通文件走
   `os.path.getsize`。
+- 服务器默认监听 `10810`，连接上启用 TCP keepalive；`--io-timeout` 默认 0
+  （保持阻塞读），设为非 0 后可用于清理半开连接。
 
 ## 5. 卡端接入
 

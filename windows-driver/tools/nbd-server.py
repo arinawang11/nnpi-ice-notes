@@ -23,7 +23,17 @@ import sys
 import threading
 import time
 import ctypes
-import msvcrt
+
+if os.name == "nt":
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.CreateFileW.restype = ctypes.c_void_p
+    _kernel32.CreateFileW.argtypes = (
+        ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p)
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+else:
+    _kernel32 = None
+    INVALID_HANDLE_VALUE = -1
 
 REQ_MAGIC = 0x25609513
 REP_MAGIC = 0x67446698
@@ -43,6 +53,17 @@ INFO_EXPORT = 0
 TRANS_FLAGS = 0x1 | 0x4 | 0x20
 
 
+def tune(conn):
+    """Low-latency plus dead-peer detection on an NBD connection."""
+    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    if hasattr(socket, "SIO_KEEPALIVE_VALS"):
+        try:
+            conn.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 10000, 3000))
+        except OSError:
+            pass
+
+
 def recvn(conn, n):
     buf = bytearray()
     while len(buf) < n:
@@ -55,11 +76,15 @@ def recvn(conn, n):
 
 def open_backing(backing, size_override):
     if backing.startswith("\\\\") or "PhysicalDrive" in backing:
+        if _kernel32 is None:
+            raise OSError("raw volume access requires Windows")
         g = 0x80000000 | 0x40000000
-        h = ctypes.windll.kernel32.CreateFileW(backing, g, 3, None, 3, 0, None)
-        if h == -1 or h == 0xFFFFFFFFFFFFFFFF:
-            raise OSError(f"CreateFile failed for {backing}")
-        fd = msvcrt.open_osfhandle(h, os.O_RDWR)
+        h = _kernel32.CreateFileW(backing, g, 3, None, 3, 0, None)
+        if h is None or h == INVALID_HANDLE_VALUE:
+            raise ctypes.WinError(ctypes.get_last_error())
+        import msvcrt
+        # O_BINARY is required: without it the CRT may translate line endings.
+        fd = msvcrt.open_osfhandle(h, os.O_RDWR | getattr(os, "O_BINARY", 0))
         f = os.fdopen(fd, "r+b", buffering=0)
         size = size_override or 16 << 30
         return f, size
@@ -99,7 +124,10 @@ def newstyle_handshake(conn, size):
             return False
 
 
-def serve_conn(conn, peer, backing, size_override=None, proto="oldstyle"):
+def serve_conn(conn, peer, backing, size_override=None, proto="oldstyle",
+               io_timeout=0):
+    tune(conn)
+    conn.settimeout(io_timeout or None)
     f, size = open_backing(backing, size_override)
     if proto == "newstyle":
         if not newstyle_handshake(conn, size):
@@ -197,7 +225,7 @@ def serve_conn(conn, peer, backing, size_override=None, proto="oldstyle"):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bind", default="192.168.115.1")
-    ap.add_argument("--port", type=int, default=10809)
+    ap.add_argument("--port", type=int, default=10810)
     ap.add_argument("--connect", default="",
                     help="connect out to HOST:PORT instead of listening")
     ap.add_argument("--retry", action="store_true",
@@ -207,6 +235,8 @@ def main():
                     help="export size for raw devices (bytes)")
     ap.add_argument("--proto", choices=("oldstyle", "newstyle"),
                     default="oldstyle")
+    ap.add_argument("--io-timeout", type=float, default=0,
+                    help="seconds; 0 keeps the old blocking behaviour")
     args = ap.parse_args()
 
     if args.connect:
@@ -215,13 +245,11 @@ def main():
                 conn = socket.create_connection(
                     tuple([args.connect.rpartition(":")[0],
                            int(args.connect.rpartition(":")[2])]), 10)
-                conn.settimeout(None)
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 print(f"[nbd] connected to {args.connect} -> {args.backing}",
                       flush=True)
                 try:
                     serve_conn(conn, args.connect, args.backing, args.size,
-                               args.proto)
+                               args.proto, args.io_timeout)
                 except (EOFError, ConnectionError, ValueError, TimeoutError) as exc:
                     print(f"[nbd] {args.connect} ended: {exc}", flush=True)
                 finally:
@@ -235,14 +263,14 @@ def main():
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((args.bind, args.port))
-    srv.listen(1)
+    srv.listen(4)
     print(f"[nbd] listening on {args.bind}:{args.port} -> {args.backing}",
           flush=True)
     while True:
         conn, peer = srv.accept()
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         try:
-            serve_conn(conn, peer, args.backing, args.size, args.proto)
+            serve_conn(conn, peer, args.backing, args.size, args.proto,
+                       args.io_timeout)
         except (EOFError, ConnectionError, ValueError, TimeoutError) as exc:
             print(f"[nbd] {peer} ended: {exc}", flush=True)
         finally:
