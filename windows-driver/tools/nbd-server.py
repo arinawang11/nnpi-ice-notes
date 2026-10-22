@@ -55,6 +55,9 @@ TRANS_FLAGS = 0x1 | 0x4 | 0x20
 
 def tune(conn):
     """Low-latency plus dead-peer detection on an NBD connection."""
+    if conn.family not in (socket.AF_INET, socket.AF_INET6):
+        # AF_UNIX socketpairs (used by the tests) reject TCP-level options.
+        return
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     if hasattr(socket, "SIO_KEEPALIVE_VALS"):

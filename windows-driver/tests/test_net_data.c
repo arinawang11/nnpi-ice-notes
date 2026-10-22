@@ -24,7 +24,7 @@ int main(void)
         assert(nnpi_net_data_classify(&d,frame(i,90,0),256,1,&length,&slot)==1);
         assert(nnpi_net_data_receive(&d,slot,length,page));
     }
-    assert(d.rx_pending==0xffff && d.stats.rx_queued==4 && d.stats.rx_dropped==12);
+    assert(d.rx_pending==0xffff && d.stats.rx_queued==16 && d.stats.rx_dropped==0);
     assert(d.stats.rx_received==16 && d.stats.rx_bytes==1440);
     assert(d.rx_lengths[0]==90 && memcmp(d.rx_frames[0],page,90)==0);
     assert(nnpi_net_data_classify(&d,frame(0,90,0),256,1,&length,&slot)==-1);
@@ -64,6 +64,22 @@ int main(void)
     assert(!d.tx.busy && !d.tx_sent && d.stats.tx_acked==16);
     assert(nnpi_net_data_classify(&d,frame(15,0,1),256,1,&length,&slot)==0);
     assert(!d.rx_pending && d.stats.unknown_ack==3);
+    /* CPU ring holds 32 but only 16 slots exist, so overflow needs two ACK
+     * rounds. The 33rd frame must be dropped, not overwrite the oldest copy. */
+    {
+        static struct nnpi_net_data o; unsigned r;
+        for(r=0;r<2;++r) {
+            for(i=0;i<16;++i) {
+                assert(nnpi_net_data_classify(&o,frame(i,90,0),256,1,&length,&slot)==1);
+                assert(nnpi_net_data_receive(&o,slot,length,page));
+            }
+            for(i=0;i<16;++i) nnpi_net_data_sent(&o,(uint8_t)i,1);
+        }
+        assert(o.stats.rx_queued==NNPI_NET_CPU_RX_CAPACITY && !o.stats.rx_dropped);
+        assert(nnpi_net_data_classify(&o,frame(0,90,0),256,1,&length,&slot)==1);
+        assert(nnpi_net_data_receive(&o,slot,length,page));
+        assert(o.stats.rx_queued==NNPI_NET_CPU_RX_CAPACITY && o.stats.rx_dropped==1);
+    }
     d.stats.version=1; d.stats.size=sizeof(d.stats); nnpi_net_data_snapshot(&d);
     assert(nnpi_net_data_response_valid(&d.stats,sizeof(d.stats)));
     d.stats.rx_ack_pending=17; assert(!nnpi_net_data_response_valid(&d.stats,sizeof(d.stats)));
